@@ -1,0 +1,84 @@
+﻿name: Kerit Cloud Auto Renew
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # 每天 UTC 02:00 (北京时间 10:00) 自动执行
+  workflow_dispatch:
+
+jobs:
+  renew-kerit:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 🐍 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 🛠️ 安装系统依赖与 SeleniumBase
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
+          pip install --no-cache-dir -r requirements.txt
+          seleniumbase install chromedriver
+
+      - name: 🌐 配置节点代理 (sing-box)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          if [ -n "$NODE_LINK" ]; then
+            echo "检测到 NODE_LINK，正在启动 sing-box 节点代理..."
+            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          else
+            echo "未设置 NODE_LINK，将使用直连模式访问"
+            echo "IS_PROXY=false" >> $GITHUB_ENV
+          fi
+
+      - name: 🚀 执行 Kerit 自动续期
+        env:
+          KERIT_EMAIL: ${{ secrets.KERIT_EMAIL }}
+          KERIT_PASSWORD: ${{ secrets.KERIT_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SERVER_NAME: ${{ secrets.SERVER_NAME }}
+        run: |
+          xvfb-run --auto-servernum -s "-screen 0 1920x1080x24" python3 app.py
+
+      - name: 📸 上传调试截图 (若有)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kerit-debug-screenshots
+          path: "*.png"
+          if-no-files-found: ignore
+
+      - name: 🧹 清理临时进程与文件
+        if: always()
+        run: |
+          pkill -f sing-box || true
+          pkill -f chromedriver || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
+          rm -f sing-box sing-box-config.json sing-box.log
+
+      - name: 🗑️ 清理旧的工作流记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId' || true)
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 2 ]; then
+              echo "清理旧运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
