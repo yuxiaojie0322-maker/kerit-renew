@@ -3,10 +3,7 @@
 """
 Kerit Cloud (billing.kerit.cloud) 自动登录与续期脚本
 架构参考: vpsfree (Playwright + NopeCHA 验证码扩展 + sing-box 节点代理)
-- 自动载入并注入 NopeCHA Key (自动处理 Cloudflare Turnstile / hCaptcha)
-- 支持本地 127.0.0.1:7890 (sing-box) 代理防风控
-- 登录后自动跳转 Free Discord Bot Hosting 并点击 "Send a heartbeat - +1 day"
-- 支持 Telegram 推送与全流程截图留存
+所有敏感配置严格通过环境变量 / Secrets 注入
 """
 
 import os
@@ -23,10 +20,10 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# ==================== 基础配置 ====================
-EMAIL = os.environ.get("KERIT_EMAIL") or os.environ.get("EMAIL") or "yuxiaojie0322@gmail.com"
-PASSWORD = os.environ.get("KERIT_PASSWORD") or os.environ.get("PASSWORD") or "YxJ223512@"
-NOPECHA_KEY = os.environ.get("NOPECHA_KEY") or "qifr6gi669wcvuj8iy30rq2j410wfjwm"
+# ==================== 环境变量配置 ====================
+EMAIL = (os.environ.get("KERIT_EMAIL") or os.environ.get("EMAIL") or "").strip()
+PASSWORD = (os.environ.get("KERIT_PASSWORD") or os.environ.get("PASSWORD") or "").strip()
+NOPECHA_KEY = os.environ.get("NOPECHA_KEY", "").strip()
 
 # 代理配置 (由 setup_proxy.py 启动 sing-box 提供，默认 127.0.0.1:7890)
 PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:7890").strip()
@@ -43,7 +40,7 @@ EXT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Telegram 消息推送 (可选)
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
-SERVER_NAME = os.environ.get("SERVER_NAME", "Kerit Free Bot").strip()
+SERVER_NAME = os.environ.get("SERVER_NAME", "Kerit Free Discord Bot").strip()
 
 def log(msg, level="INFO"):
     t = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -51,7 +48,7 @@ def log(msg, level="INFO"):
 
 def mask_email(email: str) -> str:
     if not email or "@" not in email:
-        return email or "未知"
+        return email or "未配置"
     name, domain = email.split("@", 1)
     if len(name) <= 2:
         return f"{name}***@{domain}"
@@ -60,7 +57,6 @@ def mask_email(email: str) -> str:
 # ==================== Telegram 推送 ====================
 def send_telegram(status: str, old_time: str = "", new_time: str = "", note: str = "", photo_path: str = ""):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log("未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送", "INFO")
         return
     
     t_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -79,7 +75,6 @@ def send_telegram(status: str, old_time: str = "", new_time: str = "", note: str
         caption += f"<b>说明</b>: {note}\n"
     caption += f"<b>时间</b>: {t_now} (UTC+8)"
 
-    # 如果有截图，优先发送带图消息
     if photo_path and os.path.exists(photo_path):
         try:
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
@@ -168,7 +163,6 @@ def patch_nopecha(nopecha_path, api_key):
 def extract_remaining_time(page) -> str:
     try:
         text = page.locator("body").inner_text()
-        # 匹配如 "4d 23h 53m" 或 "4 days 23 hours"
         m = re.search(r"(\d+\s*d\s*\d+\s*h\s*\d+\s*m)", text, re.IGNORECASE)
         if m:
             return m.group(1).strip()
@@ -184,6 +178,11 @@ def run_renewal():
     log("=" * 50)
     log("Kerit Cloud 自动续期任务启动")
     log("=" * 50)
+
+    if not EMAIL or not PASSWORD:
+        log("缺少必须的环境变量 KERIT_EMAIL 或 KERIT_PASSWORD！请在 Secrets 中配置", "ERROR")
+        sys.exit(1)
+
     log(f"目标账号: {mask_email(EMAIL)}")
 
     try:
@@ -192,7 +191,6 @@ def run_renewal():
         log("未安装 Playwright！请执行: pip install playwright && playwright install chromium", "ERROR")
         sys.exit(1)
 
-    # 检查并配置 NopeCHA 插件
     has_ext = os.path.exists(EXT_PATH) and os.path.exists(os.path.join(EXT_PATH, "manifest.json"))
     if has_ext:
         log(f"检测到 NopeCHA 插件: {EXT_PATH}")
@@ -200,7 +198,6 @@ def run_renewal():
     else:
         log(f"未检测到 NopeCHA 插件目录 ({EXT_PATH})，将以原生浏览器运行", "WARN")
 
-    # 测试本地代理连通性
     proxy_config = None
     if IS_PROXY and PROXY_URL:
         try:
@@ -251,23 +248,19 @@ def run_renewal():
             time.sleep(3)
             page.screenshot(path="01_login_page.png")
 
-            # 判断是否已在已登录界面
             if "/login" not in page.url.lower():
                 log("检测到当前已处于登录状态，直接进入续期流程")
             else:
                 log("正在填写账号密码...")
-                # 填充邮箱
                 page.wait_for_selector("#login-email, input[type='email'], input[name='email']", timeout=15000)
                 email_input = page.locator("#login-email, input[type='email'], input[name='email']").first
                 email_input.fill(EMAIL)
                 time.sleep(0.5)
 
-                # 填充密码
                 pwd_input = page.locator("#p-login, input[type='password'], input[name='password']").first
                 pwd_input.fill(PASSWORD)
                 time.sleep(0.5)
 
-                # 勾选信任设备 (Trust this device)
                 if page.locator("#login-trust, input[type='checkbox']").count() > 0:
                     try:
                         trust_box = page.locator("#login-trust, input[type='checkbox']").first
@@ -279,7 +272,6 @@ def run_renewal():
 
                 page.screenshot(path="02_login_filled.png")
 
-                # 辅助点击 Cloudflare Turnstile 复选框 (若存在)
                 log("等待 NopeCHA 自动识别并打码验证...")
                 time.sleep(3)
                 for _ in range(8):
@@ -299,7 +291,6 @@ def run_renewal():
                 login_btn = page.locator("#login-btn, button[type='submit'], button:has-text('Login'), button:has-text('Sign in')").first
                 login_btn.click()
 
-                # 等待登录成功跳转
                 log("等待登录跳转...")
                 logged_in = False
                 for _ in range(30):
@@ -309,7 +300,6 @@ def run_renewal():
                         logged_in = True
                         log(f"登录成功，当前 URL: {page.url}")
                         break
-                    # 检测错误提示
                     if page.locator("#login-error, .alert-danger").count() > 0:
                         err_msg = page.locator("#login-error, .alert-danger").first.inner_text()
                         if err_msg.strip():
@@ -355,7 +345,6 @@ def run_renewal():
                 send_telegram("续期按钮未找到", old_time=old_remaining, note="页面未渲染出 Send a heartbeat 按钮", photo_path="heartbeat_btn_missing.png")
                 return False
 
-            # 判断按钮是否处于禁用或冷却状态
             btn_text = heartbeat_btn.inner_text().strip()
             btn_disabled = heartbeat_btn.is_disabled() or "wait" in btn_text.lower() or "cooldown" in btn_text.lower()
 
@@ -369,7 +358,6 @@ def run_renewal():
             heartbeat_btn.click()
             time.sleep(6)
 
-            # 再次等待是否有任何弹出验证码或确认框
             for _ in range(5):
                 time.sleep(1)
                 if page.locator("button:has-text('Confirm'), button:has-text('OK'), button:has-text('Yes')").count() > 0:
@@ -383,7 +371,6 @@ def run_renewal():
             page.screenshot(path="05_heartbeat_success.png")
             log("Heartbeat 续期按钮点击完成！")
 
-            # 刷新页面重新读取最新剩余时间
             time.sleep(3)
             page.reload(wait_until="networkidle")
             time.sleep(3)

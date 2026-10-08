@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-setup_proxy.py: 自动解析节点链接并生成 sing-box config.json 配置文件
-默认监听 127.0.0.1:7890 (HTTP + SOCKS5 混合代理)
+setup_proxy.py: 自动从环境变量 NODE_LINK 解析节点并生成 sing-box config.json 配置文件
+监听 127.0.0.1:7890 (HTTP + SOCKS5 混合代理)
 支持协议: trojan://, vless://, vmess://, hysteria2://, tuic://, socks5://
 """
 import os
@@ -18,13 +18,10 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# 默认 Trojan 节点 (用户指定)
-DEFAULT_NODE = "trojan://15de72e4-f2d2-427d-9433-c1f2e20095fb@cdns.doon.eu.org:443?security=tls&sni=voroa.blibli.kdns.fr&type=ws&host=voroa.blibli.kdns.fr&path=%2Ftrojan-argo&fp=firefox#Voroa-Node-IN-Contabo_Asia_Private-2"
-
 def parse_node(link):
-    if not link or not link.strip():
-        link = DEFAULT_NODE
-    link = link.strip()
+    link = (link or "").strip()
+    if not link:
+        raise ValueError("NODE_LINK 变量为空，未提供节点链接")
     proto = link.split("://")[0].lower()
 
     if proto == "trojan":
@@ -217,15 +214,19 @@ def parse_node(link):
 
 def generate_config(node_link=None, output_path="config.json"):
     if not node_link:
-        node_link = os.environ.get("NODE_LINK", "").strip() or DEFAULT_NODE
+        node_link = os.environ.get("NODE_LINK", "").strip()
 
-    print("[INFO] 正在解析节点配置...")
+    if not node_link:
+        print("[WARN] 未检测到环境变量 NODE_LINK，跳过 sing-box 节点配置生成")
+        return None
+
+    print("[INFO] 正在从环境变量 NODE_LINK 解析节点配置...")
     try:
         outbound = parse_node(node_link)
-        print(f"[INFO] 节点解析成功: 协议={outbound['type']}, 目标服务器={outbound['server']}:{outbound['server_port']}")
+        print(f"[INFO] 节点解析成功: 协议={outbound['type']}, 服务器={outbound['server']}:{outbound['server_port']}")
     except Exception as e:
-        print(f"[WARN] 节点解析失败: {e}，回退使用默认 Trojan 节点")
-        outbound = parse_node(DEFAULT_NODE)
+        print(f"[ERROR] 节点解析失败: {e}")
+        sys.exit(1)
 
     config = {
         "log": {

@@ -45,26 +45,29 @@ jobs:
           echo "NopeCHA 插件已解压就绪 ✅"
 
       - name: 🌐 配置并启动 sing-box 节点代理
+        if: env.NODE_LINK != ''
         env:
-          NODE_LINK: ${{ secrets.NODE_LINK || 'trojan://15de72e4-f2d2-427d-9433-c1f2e20095fb@cdns.doon.eu.org:443?security=tls&sni=voroa.blibli.kdns.fr&type=ws&host=voroa.blibli.kdns.fr&path=%2Ftrojan-argo&fp=firefox#Voroa-Node-IN-Contabo_Asia_Private-2' }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           echo "安装 sing-box..."
           curl -fsSL https://github.com/SagerNet/sing-box/releases/download/v1.9.7/sing-box-1.9.7-linux-amd64.tar.gz | sudo tar -xz --strip-components=1 -C /usr/local/bin
           echo "解析节点并生成代理配置..."
           python3 setup_proxy.py
-          echo "后台启动 sing-box 代理 (端口 127.0.0.1:7890)..."
-          nohup sing-box run -c config.json > sing-box.log 2>&1 &
-          sleep 4
-          echo "测试代理连通性..."
-          curl -s -x http://127.0.0.1:7890 https://api.ip.sb/ip || true
+          if [ -f "config.json" ]; then
+            echo "后台启动 sing-box 代理 (端口 127.0.0.1:7890)..."
+            nohup sing-box run -c config.json > sing-box.log 2>&1 &
+            sleep 4
+            echo "测试代理连通性..."
+            curl -s -x http://127.0.0.1:7890 https://api.ip.sb/ip || true
+          fi
 
       - name: 🚀 运行 Kerit Cloud 自动续期
         env:
-          KERIT_EMAIL: ${{ secrets.KERIT_EMAIL || 'yuxiaojie0322@gmail.com' }}
-          KERIT_PASSWORD: ${{ secrets.KERIT_PASSWORD || 'YxJ223512@' }}
-          NOPECHA_KEY: ${{ secrets.NOPECHA_KEY || 'qifr6gi669wcvuj8iy30rq2j410wfjwm' }}
+          KERIT_EMAIL: ${{ secrets.KERIT_EMAIL }}
+          KERIT_PASSWORD: ${{ secrets.KERIT_PASSWORD }}
+          NOPECHA_KEY: ${{ secrets.NOPECHA_KEY }}
           PROXY_URL: 'http://127.0.0.1:7890'
-          IS_PROXY: 'true'
+          IS_PROXY: ${{ secrets.NODE_LINK != '' && 'true' || 'false' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           SERVER_NAME: ${{ secrets.SERVER_NAME || 'Kerit Free Discord Bot' }}
