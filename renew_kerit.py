@@ -545,23 +545,50 @@ def run_renewal():
                 send_telegram("今日已心跳/冷却中", old_time=old_remaining, new_time=old_remaining, note=f"按钮状态: {btn_text}", photo_path="heartbeat_cooldown.png")
                 return True
 
-            log(f"正在点击续期按钮: '{btn_text}'...")
-            heartbeat_btn.click()
+            log(f"准备触发续期按钮: '{btn_text}'...")
+
+            # 方案 A: 优先通过页面原生 JS 调用 freeRenew() 或 DOM click()，彻底规避任何透明遮罩拦截
+            trigger_result = page.evaluate("""() => {
+                try {
+                    if (typeof freeRenew === 'function') {
+                        freeRenew();
+                        return '成功调用全局函数 freeRenew()';
+                    }
+                    const btn = document.getElementById('free-renew-btn') || document.querySelector("button.fh-btn-primary");
+                    if (btn) {
+                        btn.click();
+                        return '成功调用 DOM btn.click()';
+                    }
+                } catch (e) {
+                    return 'JS 执行异常: ' + e.message;
+                }
+                return '未找到 freeRenew 函数或按钮';
+            }""")
+            log(f"原生触发结果: {trigger_result}")
+
+            # 方案 B: 配合 Playwright 强制点击 (force=True 绕过 pointer-events 拦截)
+            try:
+                heartbeat_btn.click(force=True, timeout=5000)
+                log("Playwright 强制点击 (force=True) 已派发")
+            except Exception as e:
+                log(f"Playwright 强制点击异常 (可忽略): {e}", "WARN")
+
             time.sleep(6)
 
-            # 确认弹窗处理 (若有二次弹窗)
+            # 确认弹窗处理 (若有二次弹窗，使用 force=True 点击)
             for _ in range(5):
                 time.sleep(1)
-                if page.locator("button:visible:has-text('Confirm'), button:visible:has-text('OK'), button:visible:has-text('Yes')").count() > 0:
+                dialog_btn = page.locator("button:visible:has-text('Confirm'), button:visible:has-text('OK'), button:visible:has-text('Yes'), .swal2-confirm")
+                if dialog_btn.count() > 0:
                     try:
-                        page.locator("button:visible:has-text('Confirm'), button:visible:has-text('OK'), button:visible:has-text('Yes')").first.click()
-                        log("点击了确认弹窗按钮")
+                        dialog_btn.first.click(force=True)
+                        log("已点击确认弹窗按钮")
                         time.sleep(2)
                     except Exception:
                         pass
 
             page.screenshot(path="06_heartbeat_success.png")
-            log("Heartbeat 续期按钮点击完成！")
+            log("Heartbeat 续期按钮触发完成！")
 
             time.sleep(3)
             page.reload(wait_until="networkidle")
