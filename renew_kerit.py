@@ -1,18 +1,22 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Kerit Cloud (billing.kerit.cloud) 自动登录与续期脚本
-架构参考: vpsfree (Playwright + NopeCHA 验证码扩展 + sing-box 节点代理)
-所有敏感配置严格通过环境变量 / Secrets 注入
+Kerit Cloud 自动每日续期脚本
+- 配合 sing-box 本地代理 (127.0.0.1:7890) 绕过 Cloudflare 区域拦截
+- 使用 Playwright 自动化浏览器完成登录
+- 智能过 KGuard (PoW / Turnstile 人机验证) 与自动防竞态重试
+- 进入 /services/free 页面并点击 "⚡ Send a heartbeat - +1 day" 续期按钮
+- 支持 Telegram Bot 截图与状态通知
 """
 
 import os
 import sys
-import re
 import time
+import re
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from playwright.sync_api import sync_playwright
 
+# 设置标准输出编码为 UTF-8
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -20,59 +24,56 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# ==================== 环境变量配置 ====================
-EMAIL = (os.environ.get("KERIT_EMAIL") or os.environ.get("EMAIL") or "").strip()
-PASSWORD = (os.environ.get("KERIT_PASSWORD") or os.environ.get("PASSWORD") or "").strip()
-NOPECHA_KEY = os.environ.get("NOPECHA_KEY", "").strip()
+# ==================== 配置读取 ====================
+EMAIL = os.getenv("KERIT_EMAIL", "")
+PASSWORD = os.getenv("KERIT_PASSWORD", "")
+NOPECHA_KEY = os.getenv("NOPECHA_KEY", "")
+PROXY_SERVER = os.getenv("PROXY_SERVER", "127.0.0.1:7890")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+SERVER_NAME = os.getenv("SERVER_NAME", "Kerit-Free-Bot")
 
-# 代理配置 (由 setup_proxy.py 启动 sing-box 提供，默认 127.0.0.1:7890)
-PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:7890").strip()
-IS_PROXY = os.environ.get("IS_PROXY", "true").lower() == "true"
+LOGIN_URL = "https://billing.kerit.cloud/login"
+FREE_HOSTING_URL = "https://billing.kerit.cloud/services/free"
 
-BASE_URL = "https://billing.kerit.cloud"
-LOGIN_URL = f"{BASE_URL}/login"
-FREE_HOSTING_URL = f"{BASE_URL}/services/free"
-
-# NopeCHA 扩展本地解压路径
-EXT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "scripts", "extensions", "nopecha", "unpacked")
-
-# Telegram 消息推送 (可选)
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
-SERVER_NAME = os.environ.get("SERVER_NAME", "Kerit Free Discord Bot").strip()
-
+# ==================== 日志与通知函数 ====================
 def log(msg, level="INFO"):
-    t = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{t}] [{level}] {msg}", flush=True)
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    prefix = f"[{now}] [{level}]"
+    print(f"{prefix} {msg}", flush=True)
 
-def mask_email(email: str) -> str:
-    if not email or "@" not in email:
-        return email or "未配置"
-    name, domain = email.split("@", 1)
-    if len(name) <= 2:
-        return f"{name}***@{domain}"
-    return f"{name[:2]}***{name[-2:]}@{domain}"
+def mask_email(email_str):
+    if not email_str or "@" not in email_str:
+        return email_str
+    user, domain = email_str.split("@", 1)
+    if len(user) <= 2:
+        return f"{user[:1]}***@{domain}"
+    return f"{user[:2]}***{user[-1:]}@{domain}"
 
-# ==================== Telegram 推送 ====================
-def send_telegram(status: str, old_time: str = "", new_time: str = "", note: str = "", photo_path: str = ""):
+def send_telegram(status, old_time=None, new_time=None, note=None, photo_path=None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
-    
-    t_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    t_now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
     caption = (
-        f"⚡ <b>Kerit Cloud 自动续期通知</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"<b>状态</b>: {status}\n"
-        f"<b>账号</b>: <code>{mask_email(EMAIL)}</code>\n"
-        f"<b>服务</b>: {SERVER_NAME}\n"
+        f"<b>Kerit Cloud 自动续期任务</b>
+"
+        f"<b>状态</b>: {status}
+"
+        f"<b>账号</b>: <code>{mask_email(EMAIL)}</code>
+"
+        f"<b>服务</b>: {SERVER_NAME}
+"
     )
     if old_time:
-        caption += f"<b>续期前剩余</b>: {old_time}\n"
+        caption += f"<b>续期前剩余</b>: {old_time}
+"
     if new_time:
-        caption += f"<b>续期后剩余</b>: {new_time}\n"
+        caption += f"<b>续期后剩余</b>: {new_time}
+"
     if note:
-        caption += f"<b>说明</b>: {note}\n"
+        caption += f"<b>说明</b>: {note}
+"
     caption += f"<b>时间</b>: {t_now} (UTC+8)"
 
     if photo_path and os.path.exists(photo_path):
@@ -134,125 +135,132 @@ def patch_nopecha(nopecha_path, api_key):
     const s = {{
         enabled: true,
         key: "{api_key}",
-        auto_solve_hcaptcha: true,
-        auto_solve_recaptcha: true,
-        auto_solve_turnstile: true,
-        recaptcha_solve_method: "image"
-    }};
-    function applySettings() {{
-        if (typeof chrome !== 'undefined' && chrome.storage) {{
-            if (chrome.storage.local) chrome.storage.local.set({{settings: s, key: "{api_key}"}});
-            if (chrome.storage.sync) chrome.storage.sync.set({{settings: s, key: "{api_key}"}});
+        turnstile_auto_solve: true,
+        hcaptcha_auto_solve: true,
+        recaptcha_auto_solve: true,
+        settings: {{
+            turnstile_auto_solve: true,
+            hcaptcha_auto_solve: true,
+            recaptcha_auto_solve: true
         }}
+    }};
+    if(typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local){{
+        chrome.storage.local.set(s, function(){{}});
+        chrome.storage.sync.set(s, function(){{}});
     }}
-    applySettings();
-    setTimeout(applySettings, 1000);
-    setTimeout(applySettings, 3000);
 }})();
 """
         with open(target_bg, "w", encoding="utf-8") as f:
-            f.write(inject + content)
-
-        log("NopeCHA API Key 成功注入插件！已启用 Turnstile/hCaptcha 自动打码")
+            f.write(inject + "
+" + content)
+        log("已成功向 NopeCHA 插件注入 API Key 与自动打码配置")
         return True
     except Exception as e:
-        log(f"NopeCHA 注入异常: {e}", "ERROR")
+        log(f"注入 NopeCHA Key 失败: {e}", "WARN")
         return False
 
-# ==================== 页面解析辅助 ====================
-def extract_remaining_time(page) -> str:
+# ==================== 辅助解析剩余时间 ====================
+def extract_remaining_time(page):
     try:
+        patterns = [
+            r"(\d+\s*(?:days?|hours?|d|h|天|小时|分))",
+            r"(Expires\s+in\s+[^<
+]+)",
+            r"(Remaining\s+time\s*:\s*[^<
+]+)",
+            r"(\d+\s*d\s*\d+\s*h)"
+        ]
         text = page.locator("body").inner_text()
-        m = re.search(r"(\d+\s*d\s*\d+\s*h\s*\d+\s*m)", text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-        m2 = re.search(r"(\d+\s*days?\s*\d+\s*hours?(?:\s*\d+\s*mins?)?)", text, re.IGNORECASE)
-        if m2:
-            return m2.group(1).strip()
-    except Exception as e:
-        log(f"提取剩余时间异常: {e}", "WARN")
+        for p in patterns:
+            m = re.search(p, text, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+    except Exception:
+        pass
     return "未知"
 
-# ==================== 主流程 ====================
+# ==================== 核心执行流程 ====================
 def run_renewal():
-    log("=" * 50)
-    log("Kerit Cloud 自动续期任务启动")
-    log("=" * 50)
+    log("==================================================")
+    log("         Kerit Cloud 自动续期任务启动              ")
+    log("==================================================")
 
     if not EMAIL or not PASSWORD:
-        log("缺少必须的环境变量 KERIT_EMAIL 或 KERIT_PASSWORD！请在 Secrets 中配置", "ERROR")
-        sys.exit(1)
+        log("缺少 KERIT_EMAIL 或 KERIT_PASSWORD 环境变量！", "ERROR")
+        send_telegram("失败", note="环境变量未配置账号或密码")
+        return False
 
-    log(f"目标账号: {mask_email(EMAIL)}")
+    log(f"账号: {mask_email(EMAIL)}")
 
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        log("未安装 Playwright！请执行: pip install playwright && playwright install chromium", "ERROR")
-        sys.exit(1)
-
-    has_ext = os.path.exists(EXT_PATH) and os.path.exists(os.path.join(EXT_PATH, "manifest.json"))
-    if has_ext:
-        log(f"检测到 NopeCHA 插件: {EXT_PATH}")
-        patch_nopecha(EXT_PATH, NOPECHA_KEY)
-    else:
-        log(f"未检测到 NopeCHA 插件目录 ({EXT_PATH})，将以原生浏览器运行", "WARN")
-
+    # 1. 检查代理连接
     proxy_config = None
-    if IS_PROXY and PROXY_URL:
+    if PROXY_SERVER:
+        log(f"正在测试 sing-box 代理: {PROXY_SERVER} ...")
         try:
-            r = requests.get("https://api.ip.sb/ip", proxies={"http": PROXY_URL, "https": PROXY_URL}, timeout=6)
-            if r.status_code == 200:
-                ip = r.text.strip()
-                log(f"sing-box 节点代理连通成功！出口 IP: {ip}")
-                proxy_config = {"server": PROXY_URL}
+            test_proxies = {
+                "http": f"http://{PROXY_SERVER}",
+                "https": f"http://{PROXY_SERVER}"
+            }
+            r = requests.get("https://api.ipify.org?format=json", proxies=test_proxies, timeout=12)
+            exit_ip = r.json().get("ip", "未知")
+            log(f"sing-box 代理连接成功！出口 IP: {exit_ip}")
+            proxy_config = {"server": f"http://{PROXY_SERVER}"}
         except Exception as e:
-            log(f"本地代理 {PROXY_URL} 无法连接 ({e})，将回退直连模式访问", "WARN")
+            log(f"sing-box 代理测试异常: {e}，尝试直接连接", "WARN")
 
+    # 2. 准备 NopeCHA 插件
+    nopecha_ext_dir = os.path.join(os.getcwd(), "nopecha_ext")
+    load_extension = False
+    if os.path.isdir(nopecha_ext_dir):
+        patch_nopecha(nopecha_ext_dir, NOPECHA_KEY)
+        load_extension = True
+        log(f"检测到已解压的 NopeCHA 插件目录: {nopecha_ext_dir}")
+
+    # 3. 启动 Chromium
     with sync_playwright() as p:
         launch_args = [
             "--no-sandbox",
+            "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
+            "--window-size=1366,768"
         ]
-        if has_ext:
+        if load_extension:
             launch_args.extend([
-                f"--disable-extensions-except={EXT_PATH}",
-                f"--load-extension={EXT_PATH}",
+                f"--disable-extensions-except={nopecha_ext_dir}",
+                f"--load-extension={nopecha_ext_dir}"
             ])
 
-        user_data_dir = os.path.join(os.getcwd(), "tmp_pw_profile")
-        os.makedirs(user_data_dir, exist_ok=True)
-
-        browser = p.chromium.launch_persistent_context(
+        user_data_dir = os.path.join(os.getcwd(), ".chromium_user_data")
+        log("启动 Chromium 浏览器上下文...")
+        context = p.chromium.launch_persistent_context(
             user_data_dir=user_data_dir,
             headless=False,
-            proxy=proxy_config,
             args=launch_args,
+            proxy=proxy_config,
             viewport={"width": 1366, "height": 768},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            locale="en-US",
-            bypass_csp=True,
-            ignore_https_errors=True,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         )
 
-        page = browser.pages[0] if browser.pages else browser.new_page()
+        page = context.new_page()
 
-        # 监听关键 API 网络响应
-        def log_responses(resp):
-            if any(k in resp.url.lower() for k in ["login", "auth", "kguard", "verify"]):
-                try:
-                    txt = resp.text()[:200]
-                    log(f"网络响应 [{resp.status}] {resp.url} -> {txt}")
-                except Exception:
-                    pass
-        page.on("response", log_responses)
-
-        old_remaining = ""
-        new_remaining = ""
+        # 监听关键网络请求便于排查
+        def log_response(res):
+            try:
+                url_low = res.url.lower()
+                if any(k in url_low for k in ["login", "kguard", "challenge", "submit", "heartbeat"]):
+                    body_preview = ""
+                    try:
+                        body_preview = " -> " + res.text()[:200].replace("\n", " ")
+                    except Exception:
+                        pass
+                    log(f"网络响应 [{res.status}] {res.url}{body_preview}")
+            except Exception:
+                pass
+        page.on("response", log_response)
 
         try:
-            # ---------------- 步骤 1: 访问登录页 ----------------
+            # ---------------- 步骤 1: 登录 ----------------
             log(f"正在访问登录页面: {LOGIN_URL}")
             page.goto(LOGIN_URL, wait_until="networkidle", timeout=60000)
             time.sleep(3)
@@ -284,76 +292,78 @@ def run_renewal():
                 page.screenshot(path="02_login_filled.png")
 
                 # ================= 触发并等待 KGuard 人机验证 =================
-                log("正在定位 KGuard 人机验证框并点击触发...")
-                try:
-                    # 查找 KGuard 容器或复选框
-                    kguard_card = page.locator("text='Verify you are human', text='Click to start', [class*='kguard'], [id*='kguard']").first
-                    if kguard_card.is_visible():
-                        kguard_card.click()
-                        log("已主动点击 KGuard 验证框")
-                except Exception as e:
-                    log(f"点击 KGuard 框提示: {e}", "WARN")
-
-                # 检查并点击 iframe (若有 Turnstile / hCaptcha)
-                for _ in range(5):
-                    time.sleep(1)
+                def is_kguard_verified():
                     try:
-                        for f in page.frames:
-                            if any(x in f.url.lower() for x in ["challenges.cloudflare.com", "turnstile", "kguard", "hcaptcha"]):
-                                cb = f.locator("input[type='checkbox'], #cf-stage, .cb-i, [role='checkbox']").first
-                                if cb.is_visible():
-                                    cb.click()
-                                    log("已点击验证码内部复选框")
-                                    break
+                        body_txt = page.locator("body").inner_text().lower()
+                        return "you are verified" in body_txt or "confirmed human" in body_txt
+                    except Exception:
+                        return False
+
+                log("正在检查并触发 KGuard 人机验证...")
+                # 尝试点击触发 KGuard 验证卡片
+                for sel in [
+                    "text='Click to start the security check'",
+                    "text='Verify you are human'",
+                    "div:has-text('Verify you are human')",
+                    "[class*='kguard']",
+                    "#kguard"
+                ]:
+                    try:
+                        loc = page.locator(sel)
+                        if loc.count() > 0 and loc.first.is_visible():
+                            loc.first.click()
+                            log(f"已点击 KGuard 目标: {sel}")
+                            break
                     except Exception:
                         pass
 
-                log("等待 KGuard 验证通过 (检测 'You are verified')...")
-                verified = False
-                for i in range(25):
+                # 等待 6 秒观察是否已经完成验证
+                for i in range(6):
                     time.sleep(1)
-                    page_text = page.locator("body").inner_text().lower()
-                    if "you are verified" in page_text or "confirmed human" in page_text:
-                        log(f"🎉 KGuard 验证成功通过！(耗时 {i+1} 秒)")
-                        verified = True
+                    if is_kguard_verified():
+                        log(f"🎉 KGuard 已成功验证！(耗时 {i+1} 秒)")
                         break
 
-                if not verified:
-                    log("未检测到 'You are verified' 提示，继续尝试提交...", "WARN")
+                # 若尚未验证通过，点击一次 Sign In 触发 KGuard PoW challenge
+                if not is_kguard_verified():
+                    log("KGuard 尚未激活，点击一次 Sign In 激活后端挑战计算...", "INFO")
+                    sign_in_btn = page.locator("button:visible:not(#login-2fa-btn)").filter(has_text="Sign In").first
+                    if sign_in_btn.is_visible():
+                        sign_in_btn.click()
 
-                # 给前端 2 秒将校验 Token 写入请求 Payload
+                    # 等待 KGuard 计算并完成 submit (最多 20 秒)
+                    for i in range(20):
+                        time.sleep(1)
+                        if is_kguard_verified():
+                            log(f"🎉 KGuard 挑战计算完毕，已成功验证！(耗时 {i+1} 秒)")
+                            break
+
+                # 给予 2 秒确保前端将验证生成的 Token 写入表单
                 time.sleep(2)
                 page.screenshot(path="02_before_submit.png")
 
-                # ================= 点击真实的 Sign In 登录按钮 =================
+                # ================= 提交登录并自愈重试 =================
                 log("正在定位并点击可见的 Sign In 登录按钮...")
                 sign_in_btn = page.locator("button:visible:not(#login-2fa-btn)").filter(has_text="Sign In").first
-
                 if not sign_in_btn.is_visible():
                     sign_in_btn = page.locator(".auth-btn:visible:not(#login-2fa-btn)").first
 
                 if sign_in_btn.is_visible():
-                    log("找到可见 Sign In 按钮，使用真实鼠标点击...")
                     sign_in_btn.click()
                 else:
-                    log("使用 JS 模拟点击可见 Sign In 按钮...", "WARN")
-                    page.evaluate("""() => {
-                        const btns = Array.from(document.querySelectorAll('button, a.auth-btn'));
-                        const b = btns.find(el => el.id !== 'login-2fa-btn' && (el.innerText || '').includes('Sign In') && el.offsetParent !== null);
-                        if (b) b.click();
-                    }""")
+                    log("未找到 Sign In 按钮，尝试 Enter 键提交", "WARN")
+                    pwd_input.press("Enter")
 
-                # 等待登录跳转
+                # 等待登录跳转中
                 log("等待登录跳转中...")
                 logged_in = False
-                for _ in range(35):
+                for step_i in range(35):
                     time.sleep(1)
-                    cur_url = page.url.lower()
-                    if "/login" not in cur_url:
+                    if any(p in page.url.lower() for p in ["/services", "/dashboard", "/account", "/client"]):
                         logged_in = True
-                        log(f"登录成功，当前 URL: {page.url}")
+                        log(f"🎉 登录成功！当前 URL: {page.url}")
                         break
-                    
+
                     # 检查 2FA 提示
                     if page.locator("#login-2fa-btn:visible, input[name*='2fa']:visible").count() > 0:
                         log("账号需要 2FA 双重身份验证！请在平台设置中关闭 2FA", "ERROR")
@@ -361,15 +371,26 @@ def run_renewal():
                         send_telegram("登录失败 (需要 2FA)", note="检测到 2FA 验证，请在平台关闭 2FA", photo_path="login_2fa_required.png")
                         return False
 
-                    # 检查错误提示
+                    page_txt = page.locator("body").inner_text().lower()
+
+                    # 关键自愈机制: 若由于之前时序原因出现 Human verification failed，但此时 KGuard 已经 verified
+                    if "human verification failed" in page_txt and is_kguard_verified():
+                        log("检测到验证码已就绪 (绿色对勾)，立即重新点击 Sign In 提交 Token！", "INFO")
+                        btn = page.locator("button:visible:not(#login-2fa-btn)").filter(has_text="Sign In").first
+                        if btn.is_visible():
+                            btn.click()
+                            time.sleep(4)
+                            continue
+
+                    # 检查其他严重错误 (如密码错误)
                     if page.locator("#login-error, .alert-danger, .error-message").count() > 0:
                         err_el = page.locator("#login-error, .alert-danger, .error-message").first
                         if err_el.is_visible():
                             err_msg = err_el.inner_text().strip()
-                            if err_msg:
+                            if "human verification failed" not in err_msg.lower():
                                 log(f"登录页面报错提示: {err_msg}", "ERROR")
                                 page.screenshot(path="login_error.png")
-                                send_telegram("登录失败", note=f"页面报错: {err_msg}", photo_path="login_error.png")
+                                send_telegram("登录失败", note=f"平台报错: {err_msg}", photo_path="login_error.png")
                                 return False
 
                 if not logged_in:
@@ -464,7 +485,7 @@ def run_renewal():
             return False
         finally:
             try:
-                browser.close()
+                context.close()
             except Exception:
                 pass
 
