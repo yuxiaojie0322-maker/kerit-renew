@@ -569,10 +569,10 @@ def run_renewal():
                             except Exception:
                                 pass
 
-            # 等待 NopeCHA 自动解决 hCaptcha 人机验证 (最长 75 秒)
-            log("等待 NopeCHA 自动解决 hCaptcha 人机验证 (最长 75 秒)...")
+            # 等待 NopeCHA 自动解决 hCaptcha 人机验证 (最长 90 秒)
+            log("等待 NopeCHA 自动解决 hCaptcha 人机验证 (最长 90 秒)...")
             hcaptcha_passed = False
-            for i in range(75):
+            for i in range(90):
                 time.sleep(1)
                 is_passed, reason, _ = check_hcaptcha_solved()
                 if is_passed:
@@ -580,17 +580,27 @@ def run_renewal():
                     hcaptcha_passed = True
                     break
 
-                # 每隔 6 秒检测一次挑战框内是否有动态视频/复杂不可解题目，如有则点击 ↻ 刷新为普通网格图片
-                if (i + 1) % 6 == 0:
+                # 每隔 4 秒检测一次挑战框内是否有动态视频、拖拽小游戏等不可解题目，如有则点击 ↻ 刷新为普通网格图片
+                if (i + 1) % 4 == 0:
                     for f in page.frames:
                         if "challenge" in f.url.lower() or "hcaptcha.com" in f.url.lower():
                             try:
-                                body_txt = f.locator("body").inner_text().lower()
-                                has_video = f.locator("video").count() > 0 or "never lands" in body_txt or "bee" in body_txt
-                                if has_video:
-                                    log("检测到复杂动态视频题目，点击 ↻ 刷新/跳过以切换为标准图片题目...")
+                                body_txt = (f.locator("body").inner_text() or "").lower()
+                                is_unsupported = any(k in body_txt for k in [
+                                    "move the", "vial", "slot", "drag", "drop", "never lands", "bee", "flower", "matching its shape"
+                                ]) or f.locator("video").count() > 0 or f.locator("canvas").count() > 0
+
+                                if is_unsupported:
+                                    log(f"检测到非标准交互题目 ('{body_txt[:40]}...')，点击 ↻ 刷新/跳过以切换为标准图片题目...")
                                     reload_clicked = False
-                                    for r_sel in [".reload", ".refresh", "[aria-label*='efresh']", "[title*='efresh']", "[title*='eload']", ".button-reload"]:
+                                    for r_sel in [
+                                        "[aria-label*='efresh']",
+                                        "[title*='efresh']",
+                                        "[aria-label*='eload']",
+                                        "[title*='eload']",
+                                        ".reload",
+                                        ".refresh"
+                                    ]:
                                         if f.locator(r_sel).count() > 0 and f.locator(r_sel).first.is_visible():
                                             f.locator(r_sel).first.click()
                                             log("已点击 ↻ 刷新题目按钮")
@@ -600,7 +610,7 @@ def run_renewal():
                                         skip_btn = f.locator(".button-submit, button, div").filter(has_text="Skip").first
                                         if skip_btn.is_visible():
                                             skip_btn.click()
-                                            log("已点击 Skip 跳过视频题目")
+                                            log("已点击 Skip 跳过题目")
                             except Exception:
                                 pass
 
