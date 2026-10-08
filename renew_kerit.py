@@ -282,17 +282,41 @@ def run_renewal():
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         )
 
-        # 官方 setup 初始化 NopeCHA 扩展配置
+        # 官方激活 NopeCHA 扩展配置 (直接写入 chrome.storage)
         if NOPECHA_KEY and load_extension:
             try:
-                log("正在通过 setup URL 激活 NopeCHA 扩展配置...")
-                setup_page = context.new_page()
-                setup_page.goto(f"https://nopecha.com/setup#key={NOPECHA_KEY}", wait_until="load", timeout=20000)
-                time.sleep(3)
-                setup_page.close()
-                log("NopeCHA 扩展官方初始化完成！")
+                ext_id = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
+                log(f"正在配置 NopeCHA 插件 storage (Extension ID: {ext_id})...")
+                ext_page = context.new_page()
+                ext_page.goto(f"chrome-extension://{ext_id}/assets/vlh38c.html", wait_until="load", timeout=15000)
+                time.sleep(1)
+                storage_res = ext_page.evaluate(f"""async () => {{
+                    return new Promise((resolve) => {{
+                        const cfg = {{
+                            key: "{NOPECHA_KEY}",
+                            enabled: true,
+                            hcaptcha_auto_solve: true,
+                            recaptcha_auto_solve: true,
+                            turnstile_auto_solve: true,
+                            settings: {{
+                                hcaptcha_auto_solve: true,
+                                recaptcha_auto_solve: true,
+                                turnstile_auto_solve: true
+                            }}
+                        }};
+                        chrome.storage.local.set(cfg, () => {{
+                            chrome.storage.sync.set(cfg, () => {{
+                                chrome.storage.local.get(null, (items) => {{
+                                    resolve(items);
+                                }});
+                            }});
+                        }});
+                    }});
+                }}""")
+                ext_page.close()
+                log(f"NopeCHA 插件配置成功！当前 Key: {str(storage_res.get('key'))[:8]}... (hcaptcha={storage_res.get('hcaptcha_auto_solve')})")
             except Exception as e:
-                log(f"NopeCHA setup 初始化异常: {e}", "WARN")
+                log(f"NopeCHA 配置异常: {e}", "WARN")
 
         page = context.new_page()
 
@@ -513,20 +537,25 @@ def run_renewal():
 
             def check_hcaptcha_solved():
                 token_val = page.evaluate("""() => {
+                    try {
+                        if (typeof hcaptcha !== 'undefined' && hcaptcha.getResponse && hcaptcha.getResponse()) {
+                            return hcaptcha.getResponse();
+                        }
+                    } catch(e) {}
                     const el = document.querySelector('[name="h-captcha-response"], [name="g-recaptcha-response"]');
                     return el ? el.value : '';
                 }""")
                 if token_val and len(token_val) > 20:
-                    return True, f"Token 已生成 (长度 {len(token_val)})"
+                    return True, f"Token 已生成 (长度 {len(token_val)})", token_val
 
                 for f in page.frames:
                     if "hcaptcha" in f.url.lower():
                         if f.locator("[aria-checked='true']").count() > 0:
-                            return True, "复选框状态显示已勾选"
-                return False, "尚未通过"
+                            return True, "复选框状态显示已勾选", token_val
+                return False, "尚未通过", ""
 
             # 检查是否已通过，未通过则仅点击一次复选框触发验证
-            is_passed, _ = check_hcaptcha_solved()
+            is_passed, _, _ = check_hcaptcha_solved()
             if not is_passed:
                 log("主动点击 hCaptcha 复选框触发挑战...")
                 for f in page.frames:
@@ -545,7 +574,7 @@ def run_renewal():
             hcaptcha_passed = False
             for i in range(75):
                 time.sleep(1)
-                is_passed, reason = check_hcaptcha_solved()
+                is_passed, reason, _ = check_hcaptcha_solved()
                 if is_passed:
                     log(f"🎉 hCaptcha 验证码成功通过！({reason}，耗时 {i+1} 秒)")
                     hcaptcha_passed = True
@@ -613,20 +642,16 @@ def run_renewal():
                 send_telegram("续期按钮未找到", old_time=old_remaining, note="页面未渲染出 Send a heartbeat 按钮", photo_path="heartbeat_btn_missing.png")
                 return False
 
-            # 打印 freeRenew 源码及 Token 状态便于调试
-            free_fn_src = page.evaluate("""() => {
-                if (typeof freeRenew === 'function') {
-                    return freeRenew.toString().slice(0, 400);
-                }
-                return 'freeRenew 未定义';
-            }""")
-            log(f"页面 freeRenew 函数定义: {free_fn_src}")
-
             token_preview = page.evaluate("""() => {
+                try {
+                    if (typeof hcaptcha !== 'undefined' && hcaptcha.getResponse && hcaptcha.getResponse()) {
+                        return hcaptcha.getResponse().slice(0, 30) + '...';
+                    }
+                } catch(e) {}
                 const el = document.querySelector('[name="h-captcha-response"]');
                 return el ? el.value.slice(0, 30) + '...' : 'none';
             }""")
-            log(f"当前 h-captcha-response Token: {token_preview}")
+            log(f"当前 hCaptcha Token 凭证: {token_preview}")
 
             btn_text = heartbeat_btn.inner_text().strip()
             btn_disabled = heartbeat_btn.is_disabled() or "wait" in btn_text.lower() or "cooldown" in btn_text.lower()
@@ -639,22 +664,33 @@ def run_renewal():
 
             log(f"准备触发续期按钮: '{btn_text}'...")
 
-            # 方案 A: 优先通过页面原生 JS 调用 freeRenew() 或 DOM click()
-            trigger_result = page.evaluate("""() => {
+            # 方案 A: 优先通过页面原生 JS 调用 freeRenew() 或 renewFreeServer(token)
+            trigger_result = page.evaluate("""async () => {
                 try {
-                    if (typeof freeRenew === 'function') {
-                        freeRenew();
-                        return '成功调用全局函数 freeRenew()';
+                    let capToken = '';
+                    if (typeof hcaptcha !== 'undefined' && hcaptcha.getResponse && hcaptcha.getResponse()) {
+                        capToken = hcaptcha.getResponse();
+                    } else {
+                        const el = document.querySelector('[name="h-captcha-response"]');
+                        if (el) capToken = el.value;
                     }
-                    const btn = document.getElementById('free-renew-btn') || document.querySelector("button.fh-btn-primary");
+                    if (typeof renewFreeServer === 'function') {
+                        const r = await renewFreeServer(capToken);
+                        return '调用 renewFreeServer 结果: ' + JSON.stringify(r);
+                    }
+                    if (typeof freeRenew === 'function') {
+                        await freeRenew();
+                        return '调用全局函数 freeRenew() 成功';
+                    }
+                    const btn = document.getElementById('free-renew-btn');
                     if (btn) {
                         btn.click();
-                        return '成功调用 DOM btn.click()';
+                        return '调用 DOM btn.click() 成功';
                     }
                 } catch (e) {
                     return 'JS 执行异常: ' + e.message;
                 }
-                return '未找到 freeRenew 函数或按钮';
+                return '未找到续期触发入口';
             }""")
             log(f"原生触发结果: {trigger_result}")
 
