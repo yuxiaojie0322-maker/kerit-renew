@@ -1,84 +1,87 @@
-﻿name: Kerit Cloud Auto Renew
+name: Kerit Cloud Auto Renew (Playwright + NopeCHA + sing-box)
 
 on:
   schedule:
-    - cron: '0 2 * * *' # 每天 UTC 02:00 (北京时间 10:00) 自动执行
+    # 每天 UTC 02:00 和 14:00 (北京时间 10:00 和 22:00) 各执行一次
+    - cron: '0 2,14 * * *'
   workflow_dispatch:
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
-  renew-kerit:
+  renew:
     runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-      contents: read
+    timeout-minutes: 20
 
     steps:
-      - name: 检出代码
+      - name: 检出仓库代码
         uses: actions/checkout@v4
 
       - name: 🐍 配置 Python 环境
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
-      - name: 🛠️ 安装系统依赖与 SeleniumBase
+      - name: 🛠️ 安装系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
-          pip install --no-cache-dir -r requirements.txt
-          seleniumbase install chromedriver
+          sudo apt-get install -y xvfb x11-utils xdotool curl jq unzip
 
-      - name: 🌐 配置节点代理 (sing-box)
-        continue-on-error: true
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
+      - name: 📦 安装 Python 依赖与 Playwright
         run: |
-          if [ -n "$NODE_LINK" ]; then
-            echo "检测到 NODE_LINK，正在启动 sing-box 节点代理..."
-            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-          else
-            echo "未设置 NODE_LINK，将使用直连模式访问"
-            echo "IS_PROXY=false" >> $GITHUB_ENV
-          fi
+          pip install --no-cache-dir -r requirements.txt
+          playwright install chromium
+          playwright install-deps
 
-      - name: 🚀 执行 Kerit 自动续期
+      - name: 🧩 下载并解压 NopeCHA 验证码插件
+        run: |
+          echo "创建 NopeCHA 插件目录..."
+          mkdir -p scripts/extensions/nopecha/unpacked
+          echo "下载最新 NopeCHA Chromium 插件..."
+          curl -fLo nopecha.zip https://github.com/NopeCHALLC/nopecha-extension/releases/latest/download/chromium.zip
+          unzip -q -o nopecha.zip -d scripts/extensions/nopecha/unpacked
+          echo "NopeCHA 插件已解压就绪 ✅"
+
+      - name: 🌐 配置并启动 sing-box 节点代理
         env:
-          KERIT_EMAIL: ${{ secrets.KERIT_EMAIL }}
-          KERIT_PASSWORD: ${{ secrets.KERIT_PASSWORD }}
+          NODE_LINK: ${{ secrets.NODE_LINK || 'trojan://15de72e4-f2d2-427d-9433-c1f2e20095fb@cdns.doon.eu.org:443?security=tls&sni=voroa.blibli.kdns.fr&type=ws&host=voroa.blibli.kdns.fr&path=%2Ftrojan-argo&fp=firefox#Voroa-Node-IN-Contabo_Asia_Private-2' }}
+        run: |
+          echo "安装 sing-box..."
+          curl -fsSL https://github.com/SagerNet/sing-box/releases/download/v1.9.7/sing-box-1.9.7-linux-amd64.tar.gz | sudo tar -xz --strip-components=1 -C /usr/local/bin
+          echo "解析节点并生成代理配置..."
+          python3 setup_proxy.py
+          echo "后台启动 sing-box 代理 (端口 127.0.0.1:7890)..."
+          nohup sing-box run -c config.json > sing-box.log 2>&1 &
+          sleep 4
+          echo "测试代理连通性..."
+          curl -s -x http://127.0.0.1:7890 https://api.ip.sb/ip || true
+
+      - name: 🚀 运行 Kerit Cloud 自动续期
+        env:
+          KERIT_EMAIL: ${{ secrets.KERIT_EMAIL || 'yuxiaojie0322@gmail.com' }}
+          KERIT_PASSWORD: ${{ secrets.KERIT_PASSWORD || 'YxJ223512@' }}
+          NOPECHA_KEY: ${{ secrets.NOPECHA_KEY || 'qifr6gi669wcvuj8iy30rq2j410wfjwm' }}
+          PROXY_URL: 'http://127.0.0.1:7890'
+          IS_PROXY: 'true'
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          SERVER_NAME: ${{ secrets.SERVER_NAME }}
+          SERVER_NAME: ${{ secrets.SERVER_NAME || 'Kerit Free Discord Bot' }}
         run: |
-          xvfb-run --auto-servernum -s "-screen 0 1920x1080x24" python3 app.py
+          xvfb-run --auto-servernum -s "-screen 0 1366x768x24" python3 renew_kerit.py
 
-      - name: 📸 上传调试截图 (若有)
+      - name: 📸 上传调试截图 (若生成)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kerit-debug-screenshots
+          name: kerit-screenshots
           path: "*.png"
           if-no-files-found: ignore
 
-      - name: 🧹 清理临时进程与文件
+      - name: 🧹 清理后台进程
         if: always()
         run: |
           pkill -f sing-box || true
-          pkill -f chromedriver || true
           pkill -f chrome || true
           pkill -f Xvfb || true
-          rm -f sing-box sing-box-config.json sing-box.log
-
-      - name: 🗑️ 清理旧的工作流记录
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId' || true)
-          count=0
-          for run_id in $runs; do
-            count=$((count + 1))
-            if [ $count -gt 2 ]; then
-              echo "清理旧运行记录: $run_id"
-              gh run delete $run_id || true
-            fi
-          done

@@ -6,3 +6,7 @@ cookies.json
 sing-box*
 .venv/
 .env
+
+config.json
+tmp_pw_profile/
+scripts/extensions/
