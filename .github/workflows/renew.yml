@@ -13,7 +13,7 @@ permissions:
 jobs:
   renew:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: 检出仓库代码
@@ -32,8 +32,7 @@ jobs:
       - name: 📦 安装 Python 依赖与 Playwright
         run: |
           pip install --no-cache-dir -r requirements.txt
-          playwright install chromium
-          playwright install-deps
+          playwright install --with-deps chromium
 
       - name: 🧩 下载并解压 NopeCHA 验证码插件
         run: |
