@@ -192,8 +192,8 @@ def extract_remaining_time(page):
     try:
         text = page.locator("body").inner_text()
         patterns = [
+            r"TIME REMAINING\s*[:\n\r\s]*([0-9dhm\s]+)",
             r"(\d+\s*d\s*\d+\s*h\s*\d+\s*m)",
-            r"TIME REMAINING\s*([\d\w\s]+)",
             r"(\d+\s*d\s*\d+\s*h)",
             r"(\d+\s*(?:days?|hours?|d|h|天|小时|分))"
         ]
@@ -436,23 +436,40 @@ def run_renewal():
             time.sleep(2)
             page.screenshot(path="03_after_login.png")
 
-            # ---------------- 步骤 2: 从侧边栏点击进入 Free Hosting 续期页面 ----------------
-            log("正在从左侧菜单栏点击进入 'Free Hosting' 页面...")
-            free_link = page.locator("a:has-text('Free Hosting'), div:has-text('Free Hosting'), nav:has-text('Free Hosting')").first
+            # ---------------- 步骤 2: 从左侧菜单栏点击进入 Free Hosting 页面 ----------------
+            log("正在通过左侧菜单栏进入 'Free Hosting' 页面...")
+            
+            # 使用 JS 在侧边栏中精确匹配并点击 Free Hosting 链接
+            clicked_link = page.evaluate("""() => {
+                const links = Array.from(document.querySelectorAll('a'));
+                for (const a of links) {
+                    const txt = (a.innerText || '').trim();
+                    const href = (a.getAttribute('href') || '').toLowerCase();
+                    if (txt.includes('Free Hosting') || href.includes('/free') || href.includes('free-hosting')) {
+                        a.click();
+                        return a.href || txt;
+                    }
+                }
+                return null;
+            }""")
 
-            if free_link.is_visible():
-                log("找到左侧 'Free Hosting' 导航链接，执行点击...")
-                free_link.click()
+            if clicked_link:
+                log(f"成功点击左侧 'Free Hosting' 菜单: {clicked_link}")
             else:
-                log("侧边栏未发现 Free Hosting 文本，尝试直接点击带有 FREE 徽章的菜单项...", "WARN")
-                badge_link = page.locator("text='FREE'").first
-                if badge_link.is_visible():
-                    badge_link.click()
+                log("尝试使用 Playwright 选择器点击 Free Hosting...", "WARN")
+                target = page.locator("a").filter(has_text="Free Hosting").first
+                if target.is_visible():
+                    target.click()
+                else:
+                    # 备选: 点击表格里的 'Renew via heartbeat' 或 'Manage'
+                    manage = page.locator("a:has-text('Manage'), button:has-text('Manage'), text='Renew via heartbeat'").first
+                    if manage.is_visible():
+                        manage.click()
 
             # 等待进入 Free Hosting 界面
             time.sleep(5)
             page.screenshot(path="04_free_hosting_page.png")
-            log(f"当前页面 URL: {page.url}")
+            log(f"进入后页面 URL: {page.url}")
 
             old_remaining = extract_remaining_time(page)
             log(f"当前剩余有效时间: {old_remaining}")
@@ -463,7 +480,7 @@ def run_renewal():
             for _ in range(6):
                 try:
                     for f in page.frames:
-                        if "hcaptcha.com" in f.url.lower():
+                        if "hcaptcha" in f.url.lower():
                             cb = f.locator("#checkbox, [role='checkbox'], .check").first
                             if cb.is_visible():
                                 cb.click()
@@ -477,10 +494,9 @@ def run_renewal():
             log("等待 NopeCHA 自动解决 hCaptcha 人机验证...")
             for i in range(25):
                 time.sleep(1)
-                # 检查 hCaptcha 是否已完成
                 hcaptcha_solved = False
                 for f in page.frames:
-                    if "hcaptcha.com" in f.url.lower():
+                    if "hcaptcha" in f.url.lower():
                         if f.locator("[aria-checked='true']").count() > 0:
                             hcaptcha_solved = True
                             break
