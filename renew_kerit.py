@@ -261,52 +261,130 @@ def run_renewal():
                 pwd_input.fill(PASSWORD)
                 time.sleep(0.5)
 
+                # 勾选信任设备 (Keep me signed in / Trust)
                 if page.locator("#login-trust, input[type='checkbox']").count() > 0:
                     try:
                         trust_box = page.locator("#login-trust, input[type='checkbox']").first
                         if not trust_box.is_checked():
                             trust_box.check()
-                            log("已勾选 'Trust this device'")
+                            log("已勾选 'Keep me signed in'")
                     except Exception:
                         pass
 
                 page.screenshot(path="02_login_filled.png")
 
-                log("等待 NopeCHA 自动识别并打码验证...")
-                time.sleep(3)
-                for _ in range(8):
+                # 处理人机验证：主动点击 KGuard 验证框触发验证
+                log("检测并点击 KGuard 人机验证框...")
+                try:
+                    kguard_candidates = [
+                        "text='Verify you are human'",
+                        "text='Click to start'",
+                        "[class*='kguard']",
+                        "[id*='kguard']",
+                        ".kguard-checkbox",
+                        "[role='checkbox']"
+                    ]
+                    for sel in kguard_candidates:
+                        loc = page.locator(sel)
+                        if loc.count() > 0 and loc.first.is_visible():
+                            log(f"点击 KGuard 元素: {sel}")
+                            loc.first.click(force=True)
+                            time.sleep(2)
+                            break
+                except Exception as e:
+                    log(f"触发 KGuard 提示: {e}", "WARN")
+
+                # 检测验证码 iframe (Turnstile / Cloudflare / hCaptcha) 并点击
+                for _ in range(6):
                     try:
                         for f in page.frames:
-                            if "challenges.cloudflare.com" in f.url or "turnstile" in f.url:
-                                cb = f.locator("input[type='checkbox'], #cf-stage, .cb-i").first
+                            if any(x in f.url.lower() for x in ["challenges.cloudflare.com", "turnstile", "kguard", "hcaptcha"]):
+                                cb = f.locator("input[type='checkbox'], #cf-stage, .cb-i, svg, [role='checkbox']").first
                                 if cb.is_visible():
                                     cb.click(force=True)
-                                    log("已主动协助点击 Turnstile 验证框")
+                                    log("已主动协助点击验证码内部复选框")
                                     break
                     except Exception:
                         pass
                     time.sleep(1)
 
-                log("正在点击登录按钮...")
-                login_btn = page.locator("#login-btn, button[type='submit'], button:has-text('Login'), button:has-text('Sign in')").first
-                login_btn.click()
+                log("等待 NopeCHA 打码插件识别与生效 (6秒)...")
+                time.sleep(6)
+                page.screenshot(path="02_before_submit.png")
 
+                # 定位并点击可见的 'Sign In' 登录按钮 (排除隐藏的 #login-2fa-btn)
+                log("正在定位可见的 Sign In 登录按钮...")
+                clicked = False
+
+                # 优先方式: 使用纯 JS 在页面上寻找当前可见且包含 Sign In 文本的按钮
+                try:
+                    res = page.evaluate("""() => {
+                        const btns = Array.from(document.querySelectorAll('button, a.auth-btn, div.auth-btn, input[type="submit"]'));
+                        for (const b of btns) {
+                            if (b.id === 'login-2fa-btn') continue;
+                            const isVisible = !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length);
+                            const txt = (b.innerText || b.textContent || b.value || '').trim();
+                            if (isVisible && (txt.toLowerCase().includes('sign in') || txt.toLowerCase().includes('login'))) {
+                                b.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                b.click();
+                                return txt;
+                            }
+                        }
+                        return null;
+                    }""")
+                    if res:
+                        log(f"通过 JS 成功触发登录按钮点击: '{res}'")
+                        clicked = True
+                except Exception as e:
+                    log(f"JS 触发登录按钮异常: {e}", "WARN")
+
+                if not clicked:
+                    # 备用选择器列表
+                    btn_selectors = [
+                        "button:visible:not(#login-2fa-btn):has-text('Sign In')",
+                        "button.auth-btn:visible:not(#login-2fa-btn)",
+                        "button[type='submit']:visible:not(#login-2fa-btn)",
+                        "button:visible:has-text('Sign In')"
+                    ]
+                    for sel in btn_selectors:
+                        try:
+                            loc = page.locator(sel)
+                            if loc.count() > 0 and loc.first.is_visible():
+                                log(f"通过选择器定位到按钮: {sel}，执行点击...")
+                                loc.first.click(force=True)
+                                clicked = True
+                                break
+                        except Exception:
+                            pass
+
+                # 等待登录跳转
                 log("等待登录跳转...")
                 logged_in = False
-                for _ in range(30):
+                for _ in range(35):
                     time.sleep(1)
                     cur_url = page.url.lower()
                     if "/login" not in cur_url:
                         logged_in = True
                         log(f"登录成功，当前 URL: {page.url}")
                         break
-                    if page.locator("#login-error, .alert-danger").count() > 0:
-                        err_msg = page.locator("#login-error, .alert-danger").first.inner_text()
-                        if err_msg.strip():
-                            log(f"登录页面报错提示: {err_msg}", "ERROR")
-                            page.screenshot(path="login_error.png")
-                            send_telegram("登录失败", note=f"页面报错: {err_msg}", photo_path="login_error.png")
-                            return False
+                    
+                    # 检查是否有 2FA 提示
+                    if page.locator("#login-2fa-btn:visible, input[name*='2fa']:visible, input[id*='2fa']:visible").count() > 0:
+                        log("账号需要 2FA 双重身份验证！无法全自动登录，请先关闭 2FA", "ERROR")
+                        page.screenshot(path="login_2fa_required.png")
+                        send_telegram("登录失败 (需要 2FA)", note="检测到 2FA 验证，请在平台关闭 2FA", photo_path="login_2fa_required.png")
+                        return False
+
+                    # 检查是否有错误提示
+                    if page.locator("#login-error, .alert-danger, .error-message").count() > 0:
+                        err_el = page.locator("#login-error, .alert-danger, .error-message").first
+                        if err_el.is_visible():
+                            err_msg = err_el.inner_text().strip()
+                            if err_msg:
+                                log(f"登录页面报错提示: {err_msg}", "ERROR")
+                                page.screenshot(path="login_error.png")
+                                send_telegram("登录失败", note=f"页面报错: {err_msg}", photo_path="login_error.png")
+                                return False
 
                 if not logged_in:
                     log("登录超时，仍停留在登录页面", "ERROR")
@@ -328,18 +406,27 @@ def run_renewal():
 
             # ---------------- 步骤 3: 查找并点击 Heartbeat 按钮 ----------------
             log("正在定位 'Send a heartbeat - +1 day' 续期按钮...")
-            heartbeat_btn = page.locator("button:has-text('Send a heartbeat'), button:has-text('heartbeat'), //button[contains(., 'heartbeat')]").first
+            heartbeat_btn = None
+            btn_selectors = [
+                "button:visible:has-text('Send a heartbeat')",
+                "button:visible:has-text('heartbeat')",
+                "//button[contains(., 'heartbeat')]"
+            ]
+            for sel in btn_selectors:
+                loc = page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    heartbeat_btn = loc.first
+                    break
 
-            if not heartbeat_btn.is_visible():
-                log("未直接发现 Heartbeat 按钮，检查页面提示...", "WARN")
-                page_text = page.locator("body").inner_text()
-                if "heartbeat" in page_text.lower():
-                    log("页面存在 heartbeat 关键词，尝试页面滚动后查找")
-                    page.mouse.wheel(0, 300)
-                    time.sleep(1)
-                    heartbeat_btn = page.locator("button:has-text('Send a heartbeat'), button:has-text('heartbeat')").first
+            if not heartbeat_btn:
+                log("未直接发现 Heartbeat 按钮，滚动页面后查找...", "WARN")
+                page.mouse.wheel(0, 300)
+                time.sleep(1)
+                loc = page.locator("button:visible:has-text('heartbeat')")
+                if loc.count() > 0 and loc.first.is_visible():
+                    heartbeat_btn = loc.first
 
-            if not heartbeat_btn.is_visible():
+            if not heartbeat_btn:
                 log("未能定位到 Heartbeat 按钮", "ERROR")
                 page.screenshot(path="heartbeat_btn_missing.png")
                 send_telegram("续期按钮未找到", old_time=old_remaining, note="页面未渲染出 Send a heartbeat 按钮", photo_path="heartbeat_btn_missing.png")
@@ -355,14 +442,15 @@ def run_renewal():
                 return True
 
             log(f"正在点击续期按钮: '{btn_text}'...")
-            heartbeat_btn.click()
+            heartbeat_btn.click(force=True)
             time.sleep(6)
 
+            # 确认弹窗处理
             for _ in range(5):
                 time.sleep(1)
-                if page.locator("button:has-text('Confirm'), button:has-text('OK'), button:has-text('Yes')").count() > 0:
+                if page.locator("button:visible:has-text('Confirm'), button:visible:has-text('OK'), button:visible:has-text('Yes')").count() > 0:
                     try:
-                        page.locator("button:has-text('Confirm'), button:has-text('OK'), button:has-text('Yes')").first.click()
+                        page.locator("button:visible:has-text('Confirm'), button:visible:has-text('OK'), button:visible:has-text('Yes')").first.click(force=True)
                         log("点击了确认弹窗按钮")
                         time.sleep(2)
                     except Exception:
