@@ -62,6 +62,7 @@ jobs:
 
       - name: 🚀 运行 Kerit Cloud 自动续期
         env:
+          KERIT_COOKIES: ${{ secrets.KERIT_COOKIES }}
           KERIT_EMAIL: ${{ secrets.KERIT_EMAIL }}
           KERIT_PASSWORD: ${{ secrets.KERIT_PASSWORD }}
           NOPECHA_KEY: ${{ secrets.NOPECHA_KEY }}

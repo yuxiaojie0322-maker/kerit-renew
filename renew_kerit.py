@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Kerit Cloud 自动每日续期脚本
+- 支持 Cookie 免登录直通续期 (避开 KGuard 与人机验证)
 - 配合 sing-box 本地代理 (127.0.0.1:7890) 绕过 Cloudflare 区域拦截
-- 使用 Playwright 自动化浏览器完成登录
-- 智能过 KGuard (PoW / Turnstile 人机验证) 与自动防竞态重试
+- 支持 Cookie 过期时自动降级回账号密码登录流程
 - 进入 /services/free 页面并点击 "⚡ Send a heartbeat - +1 day" 续期按钮
 - 支持 Telegram Bot 截图与状态通知
 """
@@ -25,6 +25,7 @@ if sys.platform == "win32":
         pass
 
 # ==================== 配置读取 ====================
+KERIT_COOKIES = os.getenv("KERIT_COOKIES", "")
 EMAIL = os.getenv("KERIT_EMAIL", "")
 PASSWORD = os.getenv("KERIT_PASSWORD", "")
 NOPECHA_KEY = os.getenv("NOPECHA_KEY", "")
@@ -95,6 +96,38 @@ def send_telegram(status, old_time=None, new_time=None, note=None, photo_path=No
         log("Telegram 文本通知发送成功")
     except Exception as e:
         log(f"TG 发送通知异常: {e}", "WARN")
+
+# ==================== Cookie 注入函数 ====================
+def inject_cookies(context, cookie_raw):
+    if not cookie_raw:
+        return False
+    cookies = []
+    for item in cookie_raw.split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"')
+
+        domain = "billing.kerit.cloud"
+        if "cf_clearance" in k or "__cf" in k or "CF_" in k:
+            domain = ".kerit.cloud"
+
+        cookies.append({
+            "name": k,
+            "value": v,
+            "domain": domain,
+            "path": "/"
+        })
+    if cookies:
+        try:
+            context.add_cookies(cookies)
+            log(f"成功注入 {len(cookies)} 个 Cookie 登录/免盾凭证！")
+            return True
+        except Exception as e:
+            log(f"注入 Cookie 异常: {e}", "WARN")
+    return False
 
 # ==================== 补丁注入 NopeCHA 扩展 ====================
 def patch_nopecha(nopecha_path, api_key):
@@ -177,12 +210,13 @@ def run_renewal():
     log("         Kerit Cloud 自动续期任务启动              ")
     log("==================================================")
 
-    if not EMAIL or not PASSWORD:
-        log("缺少 KERIT_EMAIL 或 KERIT_PASSWORD 环境变量！", "ERROR")
-        send_telegram("失败", note="环境变量未配置账号或密码")
+    if not KERIT_COOKIES and (not EMAIL or not PASSWORD):
+        log("缺少 KERIT_COOKIES 或 账号密码环境变量！", "ERROR")
+        send_telegram("失败", note="环境变量未配置 Cookie 或账号密码")
         return False
 
-    log(f"账号: {mask_email(EMAIL)}")
+    if EMAIL:
+        log(f"账号: {mask_email(EMAIL)}")
 
     # 1. 检查代理连接
     proxy_config = None
@@ -252,154 +286,160 @@ def run_renewal():
         page.on("response", log_response)
 
         try:
-            # ---------------- 步骤 1: 登录 ----------------
-            log(f"正在访问登录页面: {LOGIN_URL}")
-            page.goto(LOGIN_URL, wait_until="networkidle", timeout=60000)
-            time.sleep(3)
-            page.screenshot(path="01_login_page.png")
+            # ---------------- 步骤 1: 登录 / 恢复 Session ----------------
+            is_logged_in = False
 
-            if "/login" not in page.url.lower():
-                log("检测到当前已处于登录状态，直接进入续期流程")
-            else:
-                log("正在填写账号密码...")
-                page.wait_for_selector("#login-email, input[type='email'], input[name='email']", timeout=15000)
-                email_input = page.locator("#login-email, input[type='email'], input[name='email']").first
-                email_input.fill(EMAIL)
-                time.sleep(0.5)
+            # 优先方式: 使用 Cookie 免登录直通
+            if KERIT_COOKIES:
+                log("检测到 KERIT_COOKIES，正在注入并直接访问 Free Hosting 续期页面...")
+                inject_cookies(context, KERIT_COOKIES)
+                page.goto(FREE_HOSTING_URL, wait_until="networkidle", timeout=45000)
+                time.sleep(3)
+                page.screenshot(path="01_cookie_check.png")
 
-                pwd_input = page.locator("#p-login, input[type='password'], input[name='password']").first
-                pwd_input.fill(PASSWORD)
-                time.sleep(0.5)
+                if "/login" not in page.url.lower():
+                    log(f"🎉 成功使用 Cookie 免登录进入页面！当前 URL: {page.url}")
+                    is_logged_in = True
+                else:
+                    log("Cookie 已过期或未能通过，降级使用账号密码登录流程", "WARN")
 
-                # 勾选信任设备 (Keep me signed in)
-                if page.locator("#login-trust, input[type='checkbox']").count() > 0:
-                    try:
-                        trust_box = page.locator("#login-trust, input[type='checkbox']").first
-                        if not trust_box.is_checked():
-                            trust_box.check()
-                            log("已勾选 'Keep me signed in'")
-                    except Exception:
-                        pass
+            # 备用方式: 账号密码表单登录
+            if not is_logged_in:
+                log(f"正在访问登录页面: {LOGIN_URL}")
+                page.goto(LOGIN_URL, wait_until="networkidle", timeout=60000)
+                time.sleep(3)
+                page.screenshot(path="01_login_page.png")
 
-                page.screenshot(path="02_login_filled.png")
+                if "/login" not in page.url.lower():
+                    log("检测到当前已处于登录状态，直接进入续期流程")
+                else:
+                    log("正在填写账号密码...")
+                    page.wait_for_selector("#login-email, input[type='email'], input[name='email']", timeout=15000)
+                    email_input = page.locator("#login-email, input[type='email'], input[name='email']").first
+                    email_input.fill(EMAIL)
+                    time.sleep(0.5)
 
-                # ================= 触发并等待 KGuard 人机验证 =================
-                def is_kguard_verified():
-                    try:
-                        body_txt = page.locator("body").inner_text().lower()
-                        return "you are verified" in body_txt or "confirmed human" in body_txt
-                    except Exception:
-                        return False
+                    pwd_input = page.locator("#p-login, input[type='password'], input[name='password']").first
+                    pwd_input.fill(PASSWORD)
+                    time.sleep(0.5)
 
-                log("正在检查并触发 KGuard 人机验证...")
-                # 尝试点击触发 KGuard 验证卡片
-                for sel in [
-                    "text='Click to start the security check'",
-                    "text='Verify you are human'",
-                    "div:has-text('Verify you are human')",
-                    "[class*='kguard']",
-                    "#kguard"
-                ]:
-                    try:
-                        loc = page.locator(sel)
-                        if loc.count() > 0 and loc.first.is_visible():
-                            loc.first.click()
-                            log(f"已点击 KGuard 目标: {sel}")
-                            break
-                    except Exception:
-                        pass
+                    if page.locator("#login-trust, input[type='checkbox']").count() > 0:
+                        try:
+                            trust_box = page.locator("#login-trust, input[type='checkbox']").first
+                            if not trust_box.is_checked():
+                                trust_box.check()
+                                log("已勾选 'Keep me signed in'")
+                        except Exception:
+                            pass
 
-                # 等待 6 秒观察是否已经完成验证
-                for i in range(6):
-                    time.sleep(1)
-                    if is_kguard_verified():
-                        log(f"🎉 KGuard 已成功验证！(耗时 {i+1} 秒)")
-                        break
+                    page.screenshot(path="02_login_filled.png")
 
-                # 若尚未验证通过，点击一次 Sign In 触发后端挑战计算
-                if not is_kguard_verified():
-                    log("KGuard 尚未激活，点击一次 Sign In 激活后端挑战计算...", "INFO")
-                    sign_in_btn = page.locator("button:visible:not(#login-2fa-btn)").filter(has_text="Sign In").first
-                    if sign_in_btn.is_visible():
-                        sign_in_btn.click()
+                    # 触发并等待 KGuard 人机验证
+                    def is_kguard_verified():
+                        try:
+                            body_txt = page.locator("body").inner_text().lower()
+                            return "you are verified" in body_txt or "confirmed human" in body_txt
+                        except Exception:
+                            return False
 
-                    # 等待 KGuard 计算并完成 submit (最多 20 秒)
-                    for i in range(20):
+                    log("正在检查并触发 KGuard 人机验证...")
+                    for sel in [
+                        "text='Click to start the security check'",
+                        "text='Verify you are human'",
+                        "div:has-text('Verify you are human')",
+                        "[class*='kguard']",
+                        "#kguard"
+                    ]:
+                        try:
+                            loc = page.locator(sel)
+                            if loc.count() > 0 and loc.first.is_visible():
+                                loc.first.click()
+                                log(f"已点击 KGuard 目标: {sel}")
+                                break
+                        except Exception:
+                            pass
+
+                    for i in range(6):
                         time.sleep(1)
                         if is_kguard_verified():
-                            log(f"🎉 KGuard 挑战计算完毕，已成功验证！(耗时 {i+1} 秒)")
+                            log(f"🎉 KGuard 已成功验证！(耗时 {i+1} 秒)")
                             break
 
-                # 给予 2 秒确保前端将验证生成的 Token 写入表单
-                time.sleep(2)
-                page.screenshot(path="02_before_submit.png")
+                    if not is_kguard_verified():
+                        log("KGuard 尚未激活，点击一次 Sign In 激活后端挑战计算...", "INFO")
+                        sign_in_btn = page.locator("button:visible:not(#login-2fa-btn)").filter(has_text="Sign In").first
+                        if sign_in_btn.is_visible():
+                            sign_in_btn.click()
 
-                # ================= 提交登录并自愈重试 =================
-                log("正在定位并点击可见的 Sign In 登录按钮...")
-                sign_in_btn = page.locator("button:visible:not(#login-2fa-btn)").filter(has_text="Sign In").first
-                if not sign_in_btn.is_visible():
-                    sign_in_btn = page.locator(".auth-btn:visible:not(#login-2fa-btn)").first
+                        for i in range(20):
+                            time.sleep(1)
+                            if is_kguard_verified():
+                                log(f"🎉 KGuard 挑战计算完毕，已成功验证！(耗时 {i+1} 秒)")
+                                break
 
-                if sign_in_btn.is_visible():
-                    sign_in_btn.click()
-                else:
-                    log("未找到 Sign In 按钮，尝试 Enter 键提交", "WARN")
-                    pwd_input.press("Enter")
+                    time.sleep(2)
+                    page.screenshot(path="02_before_submit.png")
 
-                # 等待登录跳转中
-                log("等待登录跳转中...")
-                logged_in = False
-                for step_i in range(35):
-                    time.sleep(1)
-                    if any(p in page.url.lower() for p in ["/services", "/dashboard", "/account", "/client"]):
-                        logged_in = True
-                        log(f"🎉 登录成功！当前 URL: {page.url}")
-                        break
+                    log("正在定位并点击可见的 Sign In 登录按钮...")
+                    sign_in_btn = page.locator("button:visible:not(#login-2fa-btn)").filter(has_text="Sign In").first
+                    if not sign_in_btn.is_visible():
+                        sign_in_btn = page.locator(".auth-btn:visible:not(#login-2fa-btn)").first
 
-                    # 检查 2FA 提示
-                    if page.locator("#login-2fa-btn:visible, input[name*='2fa']:visible").count() > 0:
-                        log("账号需要 2FA 双重身份验证！请在平台设置中关闭 2FA", "ERROR")
-                        page.screenshot(path="login_2fa_required.png")
-                        send_telegram("登录失败 (需要 2FA)", note="检测到 2FA 验证，请在平台关闭 2FA", photo_path="login_2fa_required.png")
+                    if sign_in_btn.is_visible():
+                        sign_in_btn.click()
+                    else:
+                        pwd_input.press("Enter")
+
+                    # 等待登录跳转
+                    log("等待登录跳转中...")
+                    for step_i in range(35):
+                        time.sleep(1)
+                        if any(p in page.url.lower() for p in ["/services", "/dashboard", "/account", "/client"]):
+                            is_logged_in = True
+                            log(f"🎉 登录成功！当前 URL: {page.url}")
+                            break
+
+                        if page.locator("#login-2fa-btn:visible, input[name*='2fa']:visible").count() > 0:
+                            log("账号需要 2FA 双重身份验证！请在平台设置中关闭 2FA", "ERROR")
+                            page.screenshot(path="login_2fa_required.png")
+                            send_telegram("登录失败 (需要 2FA)", note="检测到 2FA 验证，请在平台关闭 2FA", photo_path="login_2fa_required.png")
+                            return False
+
+                        page_txt = page.locator("body").inner_text().lower()
+                        if "human verification failed" in page_txt and is_kguard_verified():
+                            log("检测到验证码已就绪 (绿色对勾)，重新点击 Sign In 提交 Token！", "INFO")
+                            btn = page.locator("button:visible:not(#login-2fa-btn)").filter(has_text="Sign In").first
+                            if btn.is_visible():
+                                btn.click()
+                                time.sleep(4)
+                                continue
+
+                        if page.locator("#login-error, .alert-danger, .error-message").count() > 0:
+                            err_el = page.locator("#login-error, .alert-danger, .error-message").first
+                            if err_el.is_visible():
+                                err_msg = err_el.inner_text().strip()
+                                if "human verification failed" not in err_msg.lower():
+                                    log(f"登录页面报错提示: {err_msg}", "ERROR")
+                                    page.screenshot(path="login_error.png")
+                                    send_telegram("登录失败", note=f"平台报错: {err_msg}", photo_path="login_error.png")
+                                    return False
+
+                    if not is_logged_in:
+                        log("登录超时，未能跳转入后台", "ERROR")
+                        page.screenshot(path="login_failed.png")
+                        send_telegram("登录超时", note="未能成功跳转出登录页", photo_path="login_failed.png")
                         return False
-
-                    page_txt = page.locator("body").inner_text().lower()
-
-                    # 关键自愈机制: 若由于之前时序原因出现 Human verification failed，但此时 KGuard 已经 verified
-                    if "human verification failed" in page_txt and is_kguard_verified():
-                        log("检测到验证码已就绪 (绿色对勾)，立即重新点击 Sign In 提交 Token！", "INFO")
-                        btn = page.locator("button:visible:not(#login-2fa-btn)").filter(has_text="Sign In").first
-                        if btn.is_visible():
-                            btn.click()
-                            time.sleep(4)
-                            continue
-
-                    # 检查其他严重错误 (如密码错误)
-                    if page.locator("#login-error, .alert-danger, .error-message").count() > 0:
-                        err_el = page.locator("#login-error, .alert-danger, .error-message").first
-                        if err_el.is_visible():
-                            err_msg = err_el.inner_text().strip()
-                            if "human verification failed" not in err_msg.lower():
-                                log(f"登录页面报错提示: {err_msg}", "ERROR")
-                                page.screenshot(path="login_error.png")
-                                send_telegram("登录失败", note=f"平台报错: {err_msg}", photo_path="login_error.png")
-                                return False
-
-                if not logged_in:
-                    log("登录超时，仍停留在登录页面", "ERROR")
-                    page.screenshot(path="login_failed.png")
-                    send_telegram("登录超时", note="未能成功跳转出登录页", photo_path="login_failed.png")
-                    return False
 
             time.sleep(2)
             page.screenshot(path="03_after_login.png")
 
             # ---------------- 步骤 2: 访问 Free Hosting 续期页面 ----------------
-            log(f"正在进入 Free Hosting 页面: {FREE_HOSTING_URL}")
-            page.goto(FREE_HOSTING_URL, wait_until="networkidle", timeout=45000)
-            time.sleep(4)
-            page.screenshot(path="04_free_hosting_page.png")
+            if "/services/free" not in page.url.lower():
+                log(f"正在进入 Free Hosting 页面: {FREE_HOSTING_URL}")
+                page.goto(FREE_HOSTING_URL, wait_until="networkidle", timeout=45000)
+                time.sleep(4)
 
+            page.screenshot(path="04_free_hosting_page.png")
             old_remaining = extract_remaining_time(page)
             log(f"当前剩余有效时间: {old_remaining}")
 
