@@ -55,26 +55,20 @@ def send_telegram(status, old_time=None, new_time=None, note=None, photo_path=No
         return
 
     t_now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-    caption = (
-        f"<b>Kerit Cloud 自动续期任务</b>
-"
-        f"<b>状态</b>: {status}
-"
-        f"<b>账号</b>: <code>{mask_email(EMAIL)}</code>
-"
-        f"<b>服务</b>: {SERVER_NAME}
-"
-    )
+    lines = [
+        "<b>Kerit Cloud 自动续期任务</b>",
+        f"<b>状态</b>: {status}",
+        f"<b>账号</b>: <code>{mask_email(EMAIL)}</code>",
+        f"<b>服务</b>: {SERVER_NAME}"
+    ]
     if old_time:
-        caption += f"<b>续期前剩余</b>: {old_time}
-"
+        lines.append(f"<b>续期前剩余</b>: {old_time}")
     if new_time:
-        caption += f"<b>续期后剩余</b>: {new_time}
-"
+        lines.append(f"<b>续期后剩余</b>: {new_time}")
     if note:
-        caption += f"<b>说明</b>: {note}
-"
-    caption += f"<b>时间</b>: {t_now} (UTC+8)"
+        lines.append(f"<b>说明</b>: {note}")
+    lines.append(f"<b>时间</b>: {t_now} (UTC+8)")
+    caption = "\n".join(lines)
 
     if photo_path and os.path.exists(photo_path):
         try:
@@ -130,29 +124,29 @@ def patch_nopecha(nopecha_path, api_key):
             log("NopeCHA 插件已注入 Key，跳过重复写入", "INFO")
             return True
 
-        inject = f"""// NopeCHA-Inject-Kerit
-(function(){{
-    const s = {{
-        enabled: true,
-        key: "{api_key}",
-        turnstile_auto_solve: true,
-        hcaptcha_auto_solve: true,
-        recaptcha_auto_solve: true,
-        settings: {{
-            turnstile_auto_solve: true,
-            hcaptcha_auto_solve: true,
-            recaptcha_auto_solve: true
-        }}
-    }};
-    if(typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local){{
-        chrome.storage.local.set(s, function(){{}});
-        chrome.storage.sync.set(s, function(){{}});
-    }}
-}})();
-"""
+        inject_code = (
+            "// NopeCHA-Inject-Kerit\n"
+            "(function(){\n"
+            "    const s = {\n"
+            "        enabled: true,\n"
+            f'        key: "{api_key}",\n'
+            "        turnstile_auto_solve: true,\n"
+            "        hcaptcha_auto_solve: true,\n"
+            "        recaptcha_auto_solve: true,\n"
+            "        settings: {\n"
+            "            turnstile_auto_solve: true,\n"
+            "            hcaptcha_auto_solve: true,\n"
+            "            recaptcha_auto_solve: true\n"
+            "        }\n"
+            "    };\n"
+            "    if(typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local){\n"
+            "        chrome.storage.local.set(s, function(){});\n"
+            "        chrome.storage.sync.set(s, function(){});\n"
+            "    }\n"
+            "})();\n"
+        )
         with open(target_bg, "w", encoding="utf-8") as f:
-            f.write(inject + "
-" + content)
+            f.write(inject_code + "\n" + content)
         log("已成功向 NopeCHA 插件注入 API Key 与自动打码配置")
         return True
     except Exception as e:
@@ -164,10 +158,8 @@ def extract_remaining_time(page):
     try:
         patterns = [
             r"(\d+\s*(?:days?|hours?|d|h|天|小时|分))",
-            r"(Expires\s+in\s+[^<
-]+)",
-            r"(Remaining\s+time\s*:\s*[^<
-]+)",
+            r"(Expires\s+in\s+[^<\n]+)",
+            r"(Remaining\s+time\s*:\s*[^<\n]+)",
             r"(\d+\s*d\s*\d+\s*h)"
         ]
         text = page.locator("body").inner_text()
@@ -324,7 +316,7 @@ def run_renewal():
                         log(f"🎉 KGuard 已成功验证！(耗时 {i+1} 秒)")
                         break
 
-                # 若尚未验证通过，点击一次 Sign In 触发 KGuard PoW challenge
+                # 若尚未验证通过，点击一次 Sign In 触发后端挑战计算
                 if not is_kguard_verified():
                     log("KGuard 尚未激活，点击一次 Sign In 激活后端挑战计算...", "INFO")
                     sign_in_btn = page.locator("button:visible:not(#login-2fa-btn)").filter(has_text="Sign In").first
