@@ -238,12 +238,23 @@ def run_renewal():
             log(f"sing-box 代理测试异常: {e}，尝试直接连接", "WARN")
 
     # 2. 准备 NopeCHA 插件
-    nopecha_ext_dir = os.path.join(os.getcwd(), "nopecha_ext")
+    candidate_nopecha_dirs = [
+        os.path.join(os.getcwd(), "nopecha_ext"),
+        os.path.join(os.getcwd(), "scripts", "extensions", "nopecha", "unpacked"),
+    ]
+    nopecha_ext_dir = None
+    for d in candidate_nopecha_dirs:
+        if os.path.isdir(d):
+            nopecha_ext_dir = d
+            break
+
     load_extension = False
-    if os.path.isdir(nopecha_ext_dir):
+    if nopecha_ext_dir:
         patch_nopecha(nopecha_ext_dir, NOPECHA_KEY)
         load_extension = True
         log(f"检测到已解压的 NopeCHA 插件目录: {nopecha_ext_dir}")
+    else:
+        log("未检测到 NopeCHA 插件目录！", "WARN")
 
     # 3. 启动 Chromium
     with sync_playwright() as p:
@@ -271,16 +282,28 @@ def run_renewal():
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         )
 
+        # 官方 setup 初始化 NopeCHA 扩展配置
+        if NOPECHA_KEY and load_extension:
+            try:
+                log("正在通过 setup URL 激活 NopeCHA 扩展配置...")
+                setup_page = context.new_page()
+                setup_page.goto(f"https://nopecha.com/setup#key={NOPECHA_KEY}", wait_until="load", timeout=20000)
+                time.sleep(3)
+                setup_page.close()
+                log("NopeCHA 扩展官方初始化完成！")
+            except Exception as e:
+                log(f"NopeCHA setup 初始化异常: {e}", "WARN")
+
         page = context.new_page()
 
         # 监听关键网络请求便于排查
         def log_response(res):
             try:
                 url_low = res.url.lower()
-                if any(k in url_low for k in ["login", "heartbeat", "renew", "hcaptcha"]):
+                if any(k in url_low for k in ["login", "heartbeat", "renew", "hcaptcha", "free", "api", "action"]):
                     body_preview = ""
                     try:
-                        body_preview = " -> " + res.text()[:200].replace("\n", " ")
+                        body_preview = " -> " + res.text()[:250].replace("\n", " ")
                     except Exception:
                         pass
                     log(f"网络响应 [{res.status}] {res.url}{body_preview}")
@@ -476,41 +499,60 @@ def run_renewal():
 
             # ---------------- 步骤 3: 检查并完成 hCaptcha 验证码 ----------------
             log("正在检查页面中的 hCaptcha 验证码 ('我是真实访客')...")
-            # 尝试主动点击 hCaptcha 复选框以触发 NopeCHA 打码
-            for _ in range(6):
-                try:
-                    for f in page.frames:
-                        if "hcaptcha" in f.url.lower():
-                            cb = f.locator("#checkbox, [role='checkbox'], .check").first
-                            if cb.is_visible():
-                                cb.click()
-                                log("已点击 hCaptcha 内部复选框，等待 NopeCHA 自动识别完成...")
-                                break
-                except Exception:
-                    pass
-                time.sleep(1)
 
-            # 等待 NopeCHA 打码识别 (最多 25 秒)
-            log("等待 NopeCHA 自动解决 hCaptcha 人机验证...")
-            for i in range(25):
-                time.sleep(1)
-                hcaptcha_solved = False
+            def check_hcaptcha_solved():
+                token_val = page.evaluate("""() => {
+                    const el = document.querySelector('[name="h-captcha-response"], [name="g-recaptcha-response"]');
+                    return el ? el.value : '';
+                }""")
+                if token_val and len(token_val) > 20:
+                    return True, f"Token 已生成 (长度 {len(token_val)})"
+
                 for f in page.frames:
                     if "hcaptcha" in f.url.lower():
                         if f.locator("[aria-checked='true']").count() > 0:
-                            hcaptcha_solved = True
-                            break
-                if hcaptcha_solved:
-                    log(f"🎉 hCaptcha 验证码成功通过！(耗时 {i+1} 秒)")
+                            return True, "复选框状态显示已勾选"
+                return False, "尚未通过"
+
+            # 检查是否已通过，未通过则仅点击一次复选框触发验证
+            is_passed, _ = check_hcaptcha_solved()
+            if not is_passed:
+                log("主动点击 hCaptcha 复选框触发挑战...")
+                for f in page.frames:
+                    if "hcaptcha" in f.url.lower():
+                        cb = f.locator("#checkbox, [role='checkbox'], .check").first
+                        if cb.is_visible():
+                            try:
+                                cb.click()
+                                log("已点击 hCaptcha 内部复选框")
+                                break
+                            except Exception:
+                                pass
+
+            # 等待 NopeCHA 自动解决 hCaptcha 人机验证 (最长 60 秒)
+            log("等待 NopeCHA 自动解决 hCaptcha 人机验证 (最长 60 秒)...")
+            hcaptcha_passed = False
+            for i in range(60):
+                time.sleep(1)
+                is_passed, reason = check_hcaptcha_solved()
+                if is_passed:
+                    log(f"🎉 hCaptcha 验证码成功通过！({reason}，耗时 {i+1} 秒)")
+                    hcaptcha_passed = True
                     break
 
             time.sleep(2)
             page.screenshot(path="05_hcaptcha_done.png")
 
+            if not hcaptcha_passed:
+                log("⚠️ hCaptcha 验证码未能在规定时间内通过！将无法成功增加续期时间！", "ERROR")
+                send_telegram("验证码未通过", old_time=old_remaining, note="hCaptcha 验证未完成，无法发送心跳包", photo_path="05_hcaptcha_done.png")
+                return False
+
             # ---------------- 步骤 4: 查找并点击 Heartbeat 续期按钮 ----------------
             log("正在定位 'Send a heartbeat' 续期按钮...")
             heartbeat_btn = None
             btn_selectors = [
+                "#free-renew-btn",
                 "button:visible:has-text('Send a heartbeat')",
                 "button:visible:has-text('heartbeat')",
                 "//button[contains(., 'heartbeat')]",
@@ -526,7 +568,7 @@ def run_renewal():
                 log("未直接发现 Heartbeat 按钮，滚动页面后查找...", "WARN")
                 page.mouse.wheel(0, 300)
                 time.sleep(1)
-                loc = page.locator("button:visible:has-text('heartbeat'), button:visible:has-text('Send a heartbeat')")
+                loc = page.locator("#free-renew-btn, button:visible:has-text('heartbeat'), button:visible:has-text('Send a heartbeat')")
                 if loc.count() > 0 and loc.first.is_visible():
                     heartbeat_btn = loc.first
 
@@ -535,6 +577,21 @@ def run_renewal():
                 page.screenshot(path="heartbeat_btn_missing.png")
                 send_telegram("续期按钮未找到", old_time=old_remaining, note="页面未渲染出 Send a heartbeat 按钮", photo_path="heartbeat_btn_missing.png")
                 return False
+
+            # 打印 freeRenew 源码及 Token 状态便于调试
+            free_fn_src = page.evaluate("""() => {
+                if (typeof freeRenew === 'function') {
+                    return freeRenew.toString().slice(0, 400);
+                }
+                return 'freeRenew 未定义';
+            }""")
+            log(f"页面 freeRenew 函数定义: {free_fn_src}")
+
+            token_preview = page.evaluate("""() => {
+                const el = document.querySelector('[name="h-captcha-response"]');
+                return el ? el.value.slice(0, 30) + '...' : 'none';
+            }""")
+            log(f"当前 h-captcha-response Token: {token_preview}")
 
             btn_text = heartbeat_btn.inner_text().strip()
             btn_disabled = heartbeat_btn.is_disabled() or "wait" in btn_text.lower() or "cooldown" in btn_text.lower()
@@ -547,7 +604,7 @@ def run_renewal():
 
             log(f"准备触发续期按钮: '{btn_text}'...")
 
-            # 方案 A: 优先通过页面原生 JS 调用 freeRenew() 或 DOM click()，彻底规避任何透明遮罩拦截
+            # 方案 A: 优先通过页面原生 JS 调用 freeRenew() 或 DOM click()
             trigger_result = page.evaluate("""() => {
                 try {
                     if (typeof freeRenew === 'function') {
@@ -573,7 +630,7 @@ def run_renewal():
             except Exception as e:
                 log(f"Playwright 强制点击异常 (可忽略): {e}", "WARN")
 
-            time.sleep(6)
+            time.sleep(8)
 
             # 确认弹窗处理 (若有二次弹窗，使用 force=True 点击)
             for _ in range(5):
@@ -590,13 +647,32 @@ def run_renewal():
             page.screenshot(path="06_heartbeat_success.png")
             log("Heartbeat 续期按钮触发完成！")
 
-            time.sleep(3)
+            # 重新加载页面以准确读取最新的时间
+            log("重新加载页面以获取续期后最新有效时间...")
             page.reload(wait_until="networkidle")
-            time.sleep(3)
-            new_remaining = extract_remaining_time(page)
-            log(f"续期后最新剩余时间: {new_remaining}")
+            time.sleep(5)
 
-            send_telegram("续期成功", old_time=old_remaining, new_time=new_remaining, note="Heartbeat 心跳包已成功发送", photo_path="06_heartbeat_success.png")
+            # 点击 Free Hosting 以确保卡片重新渲染
+            page.evaluate("""() => {
+                const links = Array.from(document.querySelectorAll('a'));
+                for (const a of links) {
+                    if ((a.innerText || '').includes('Free Hosting')) {
+                        a.click();
+                        break;
+                    }
+                }
+            }""")
+            time.sleep(4)
+            page.screenshot(path="07_renew_final.png")
+
+            new_remaining = extract_remaining_time(page)
+            log(f"续期前剩余: {old_remaining} | 续期后剩余: {new_remaining}")
+
+            if new_remaining != "未知" and old_remaining != "未知" and new_remaining == old_remaining:
+                log("⚠️ 剩余时间未发生变化，可能心跳包未被后端接受或今日已达上限", "WARN")
+                send_telegram("时间未变", old_time=old_remaining, new_time=new_remaining, note="已触发心跳，但有效时间未增加，请检查控制台配额", photo_path="07_renew_final.png")
+            else:
+                send_telegram("续期成功", old_time=old_remaining, new_time=new_remaining, note="Heartbeat 心跳包已成功发送，时间已延长！", photo_path="07_renew_final.png")
             return True
 
         except Exception as e:

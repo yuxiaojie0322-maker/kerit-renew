@@ -37,10 +37,10 @@ jobs:
       - name: 🧩 下载并解压 NopeCHA 验证码插件
         run: |
           echo "创建 NopeCHA 插件目录..."
-          mkdir -p scripts/extensions/nopecha/unpacked
+          mkdir -p nopecha_ext
           echo "下载最新 NopeCHA Chromium 插件..."
           curl -fLo nopecha.zip https://github.com/NopeCHALLC/nopecha-extension/releases/latest/download/chromium.zip
-          unzip -q -o nopecha.zip -d scripts/extensions/nopecha/unpacked
+          unzip -q -o nopecha.zip -d nopecha_ext
           echo "NopeCHA 插件已解压就绪 ✅"
 
       - name: 🌐 配置并启动 sing-box 节点代理
