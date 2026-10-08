@@ -3,8 +3,9 @@
 Kerit Cloud 自动每日续期脚本
 - 支持 Cookie 免登录直通续期 (避开 KGuard 与人机验证)
 - 配合 sing-box 本地代理 (127.0.0.1:7890) 绕过 Cloudflare 区域拦截
-- 支持 Cookie 过期时自动降级回账号密码登录流程
-- 进入 /services/free 页面并点击 "⚡ Send a heartbeat - +1 day" 续期按钮
+- 从侧边栏精准点击 '🎁 Free Hosting' 页面
+- NopeCHA 自动解决 hCaptcha ('我是真实访客') 人机验证
+- 自动点击 '⚡ Send a heartbeat · +1 day' 续期按钮
 - 支持 Telegram Bot 截图与状态通知
 """
 
@@ -35,7 +36,7 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 SERVER_NAME = os.getenv("SERVER_NAME", "Kerit-Free-Bot")
 
 LOGIN_URL = "https://billing.kerit.cloud/login"
-FREE_HOSTING_URL = "https://billing.kerit.cloud/services/free"
+DASHBOARD_URL = "https://billing.kerit.cloud/dashboard"
 
 # ==================== 日志与通知函数 ====================
 def log(msg, level="INFO"):
@@ -189,17 +190,19 @@ def patch_nopecha(nopecha_path, api_key):
 # ==================== 辅助解析剩余时间 ====================
 def extract_remaining_time(page):
     try:
-        patterns = [
-            r"(\d+\s*(?:days?|hours?|d|h|天|小时|分))",
-            r"(Expires\s+in\s+[^<\n]+)",
-            r"(Remaining\s+time\s*:\s*[^<\n]+)",
-            r"(\d+\s*d\s*\d+\s*h)"
-        ]
         text = page.locator("body").inner_text()
+        patterns = [
+            r"(\d+\s*d\s*\d+\s*h\s*\d+\s*m)",
+            r"TIME REMAINING\s*([\d\w\s]+)",
+            r"(\d+\s*d\s*\d+\s*h)",
+            r"(\d+\s*(?:days?|hours?|d|h|天|小时|分))"
+        ]
         for p in patterns:
             m = re.search(p, text, re.IGNORECASE)
             if m:
-                return m.group(1).strip()
+                res = m.group(1).strip()
+                if len(res) < 30:
+                    return res
     except Exception:
         pass
     return "未知"
@@ -274,7 +277,7 @@ def run_renewal():
         def log_response(res):
             try:
                 url_low = res.url.lower()
-                if any(k in url_low for k in ["login", "kguard", "challenge", "submit", "heartbeat"]):
+                if any(k in url_low for k in ["login", "heartbeat", "renew", "hcaptcha"]):
                     body_preview = ""
                     try:
                         body_preview = " -> " + res.text()[:200].replace("\n", " ")
@@ -291,14 +294,14 @@ def run_renewal():
 
             # 优先方式: 使用 Cookie 免登录直通
             if KERIT_COOKIES:
-                log("检测到 KERIT_COOKIES，正在注入并直接访问 Free Hosting 续期页面...")
+                log("检测到 KERIT_COOKIES，正在注入并直接访问控制台...")
                 inject_cookies(context, KERIT_COOKIES)
-                page.goto(FREE_HOSTING_URL, wait_until="networkidle", timeout=45000)
+                page.goto(DASHBOARD_URL, wait_until="networkidle", timeout=45000)
                 time.sleep(3)
                 page.screenshot(path="01_cookie_check.png")
 
                 if "/login" not in page.url.lower():
-                    log(f"🎉 成功使用 Cookie 免登录进入页面！当前 URL: {page.url}")
+                    log(f"🎉 成功使用 Cookie 免登录进入控制台！当前 URL: {page.url}")
                     is_logged_in = True
                 else:
                     log("Cookie 已过期或未能通过，降级使用账号密码登录流程", "WARN")
@@ -433,23 +436,69 @@ def run_renewal():
             time.sleep(2)
             page.screenshot(path="03_after_login.png")
 
-            # ---------------- 步骤 2: 访问 Free Hosting 续期页面 ----------------
-            if "/services/free" not in page.url.lower():
-                log(f"正在进入 Free Hosting 页面: {FREE_HOSTING_URL}")
-                page.goto(FREE_HOSTING_URL, wait_until="networkidle", timeout=45000)
-                time.sleep(4)
+            # ---------------- 步骤 2: 从侧边栏点击进入 Free Hosting 续期页面 ----------------
+            log("正在从左侧菜单栏点击进入 'Free Hosting' 页面...")
+            free_link = page.locator("a:has-text('Free Hosting'), div:has-text('Free Hosting'), nav:has-text('Free Hosting')").first
 
+            if free_link.is_visible():
+                log("找到左侧 'Free Hosting' 导航链接，执行点击...")
+                free_link.click()
+            else:
+                log("侧边栏未发现 Free Hosting 文本，尝试直接点击带有 FREE 徽章的菜单项...", "WARN")
+                badge_link = page.locator("text='FREE'").first
+                if badge_link.is_visible():
+                    badge_link.click()
+
+            # 等待进入 Free Hosting 界面
+            time.sleep(5)
             page.screenshot(path="04_free_hosting_page.png")
+            log(f"当前页面 URL: {page.url}")
+
             old_remaining = extract_remaining_time(page)
             log(f"当前剩余有效时间: {old_remaining}")
 
-            # ---------------- 步骤 3: 查找并点击 Heartbeat 按钮 ----------------
-            log("正在定位 'Send a heartbeat - +1 day' 续期按钮...")
+            # ---------------- 步骤 3: 检查并完成 hCaptcha 验证码 ----------------
+            log("正在检查页面中的 hCaptcha 验证码 ('我是真实访客')...")
+            # 尝试主动点击 hCaptcha 复选框以触发 NopeCHA 打码
+            for _ in range(6):
+                try:
+                    for f in page.frames:
+                        if "hcaptcha.com" in f.url.lower():
+                            cb = f.locator("#checkbox, [role='checkbox'], .check").first
+                            if cb.is_visible():
+                                cb.click()
+                                log("已点击 hCaptcha 内部复选框，等待 NopeCHA 自动识别完成...")
+                                break
+                except Exception:
+                    pass
+                time.sleep(1)
+
+            # 等待 NopeCHA 打码识别 (最多 25 秒)
+            log("等待 NopeCHA 自动解决 hCaptcha 人机验证...")
+            for i in range(25):
+                time.sleep(1)
+                # 检查 hCaptcha 是否已完成
+                hcaptcha_solved = False
+                for f in page.frames:
+                    if "hcaptcha.com" in f.url.lower():
+                        if f.locator("[aria-checked='true']").count() > 0:
+                            hcaptcha_solved = True
+                            break
+                if hcaptcha_solved:
+                    log(f"🎉 hCaptcha 验证码成功通过！(耗时 {i+1} 秒)")
+                    break
+
+            time.sleep(2)
+            page.screenshot(path="05_hcaptcha_done.png")
+
+            # ---------------- 步骤 4: 查找并点击 Heartbeat 续期按钮 ----------------
+            log("正在定位 'Send a heartbeat' 续期按钮...")
             heartbeat_btn = None
             btn_selectors = [
                 "button:visible:has-text('Send a heartbeat')",
                 "button:visible:has-text('heartbeat')",
-                "//button[contains(., 'heartbeat')]"
+                "//button[contains(., 'heartbeat')]",
+                "//button[contains(., 'Send a heartbeat')]"
             ]
             for sel in btn_selectors:
                 loc = page.locator(sel)
@@ -461,7 +510,7 @@ def run_renewal():
                 log("未直接发现 Heartbeat 按钮，滚动页面后查找...", "WARN")
                 page.mouse.wheel(0, 300)
                 time.sleep(1)
-                loc = page.locator("button:visible:has-text('heartbeat')")
+                loc = page.locator("button:visible:has-text('heartbeat'), button:visible:has-text('Send a heartbeat')")
                 if loc.count() > 0 and loc.first.is_visible():
                     heartbeat_btn = loc.first
 
@@ -484,7 +533,7 @@ def run_renewal():
             heartbeat_btn.click()
             time.sleep(6)
 
-            # 确认弹窗处理
+            # 确认弹窗处理 (若有二次弹窗)
             for _ in range(5):
                 time.sleep(1)
                 if page.locator("button:visible:has-text('Confirm'), button:visible:has-text('OK'), button:visible:has-text('Yes')").count() > 0:
@@ -495,7 +544,7 @@ def run_renewal():
                     except Exception:
                         pass
 
-            page.screenshot(path="05_heartbeat_success.png")
+            page.screenshot(path="06_heartbeat_success.png")
             log("Heartbeat 续期按钮点击完成！")
 
             time.sleep(3)
@@ -504,7 +553,7 @@ def run_renewal():
             new_remaining = extract_remaining_time(page)
             log(f"续期后最新剩余时间: {new_remaining}")
 
-            send_telegram("续期成功", old_time=old_remaining, new_time=new_remaining, note="Heartbeat 心跳包已成功发送", photo_path="05_heartbeat_success.png")
+            send_telegram("续期成功", old_time=old_remaining, new_time=new_remaining, note="Heartbeat 心跳包已成功发送", photo_path="06_heartbeat_success.png")
             return True
 
         except Exception as e:
