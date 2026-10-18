@@ -1,90 +1,89 @@
-name: Kerit Cloud Auto Renew (Playwright + NopeCHA + sing-box)
+name: Kerit Cloud 自动心跳续期
 
 on:
   schedule:
-    # 每天 UTC 02:00 和 14:00 (北京时间 10:00 和 22:00) 各执行一次
+    # 每天北京时间 10:00 和 22:00 各执行一次 (UTC 02:00, 14:00)
     - cron: '0 2,14 * * *'
   workflow_dispatch:
 
 permissions:
-  actions: write
   contents: read
+  actions: write
+
+env:
+  NODE_LINK:       ${{ secrets.NODE_LINK }}
+  KERIT:           ${{ secrets.KERIT }}
+  KERIT_EMAIL:     ${{ secrets.KERIT_EMAIL }}
+  KERIT_PASSWORD:  ${{ secrets.KERIT_PASSWORD }}
+  TG_BOT_TOKEN:    ${{ secrets.TG_BOT_TOKEN }}
+  TG_CHAT_ID:      ${{ secrets.TG_CHAT_ID }}
+  NOPECHA_KEY:     ${{ secrets.NOPECHA_KEY }}
+  OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
+  OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+  OPENAI_MODEL:    ${{ secrets.OPENAI_MODEL }}
 
 jobs:
   renew:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    name: Kerit 心跳续期
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
 
     steps:
-      - name: 检出仓库代码
+      - name: 检出私有核心仓库
         uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/my-private-scripts
+          path: scripts
+          token: ${{ secrets.CORE_SCRIPT_TOKEN || secrets.REPO_TOKEN || secrets.GH_PAT_PRIVATE_REPO }}
 
-      - name: 🐍 配置 Python 环境
+      - name: 配置 Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 🛠️ 安装系统依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils xdotool curl jq unzip
-
-      - name: 📦 安装 Python 依赖与 Playwright
-        run: |
-          pip install --no-cache-dir -r requirements.txt
-          playwright install --with-deps chromium
-
-      - name: 🧩 下载并解压 NopeCHA 验证码插件
-        run: |
-          echo "创建 NopeCHA 插件目录..."
-          mkdir -p nopecha_ext
-          echo "下载最新 NopeCHA Chromium 插件..."
-          curl -fLo nopecha.zip https://github.com/NopeCHALLC/nopecha-extension/releases/latest/download/chromium.zip
-          unzip -q -o nopecha.zip -d nopecha_ext
-          echo "NopeCHA 插件已解压就绪 ✅"
-
-      - name: 🌐 配置并启动 sing-box 节点代理
-        if: env.NODE_LINK != ''
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-        run: |
-          echo "安装 sing-box..."
-          curl -fsSL https://github.com/SagerNet/sing-box/releases/download/v1.9.7/sing-box-1.9.7-linux-amd64.tar.gz | sudo tar -xz --strip-components=1 -C /usr/local/bin
-          echo "解析节点并生成代理配置..."
-          python3 setup_proxy.py
-          if [ -f "config.json" ]; then
-            echo "后台启动 sing-box 代理 (端口 127.0.0.1:7890)..."
-            nohup sing-box run -c config.json > sing-box.log 2>&1 &
-            sleep 4
-            echo "测试代理连通性..."
-            curl -s -x http://127.0.0.1:7890 https://api.ip.sb/ip || true
-          fi
-
-      - name: 🚀 运行 Kerit Cloud 自动续期
-        env:
-          KERIT_COOKIES: ${{ secrets.KERIT_COOKIES }}
-          KERIT_EMAIL: ${{ secrets.KERIT_EMAIL }}
-          KERIT_PASSWORD: ${{ secrets.KERIT_PASSWORD }}
-          NOPECHA_KEY: ${{ secrets.NOPECHA_KEY }}
-          PROXY_URL: 'http://127.0.0.1:7890'
-          IS_PROXY: ${{ secrets.NODE_LINK != '' && 'true' || 'false' }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          SERVER_NAME: ${{ secrets.SERVER_NAME || 'Kerit Free Discord Bot' }}
-        run: |
-          xvfb-run --auto-servernum -s "-screen 0 1366x768x24" python3 renew_kerit.py
-
-      - name: 📸 上传调试截图 (若生成)
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: 缓存 pip
+        uses: actions/cache@v4
         with:
-          name: kerit-screenshots
-          path: "*.png"
-          if-no-files-found: ignore
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ github.job }}-v1
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ github.job }}-
 
-      - name: 🧹 清理后台进程
-        if: always()
+      - name: 安装系统底层依赖
         run: |
-          pkill -f sing-box || true
-          pkill -f chrome || true
-          pkill -f Xvfb || true
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            xvfb fonts-noto-cjk p7zip-full git curl jq
+
+      - name: 安装 Python 库
+        run: |
+          pip install -q seleniumbase requests playwright opencv-python-headless \
+                        msgpack typer matplotlib google-genai httpx \
+                        loguru pydantic-settings tenacity pytz
+
+      - name: 安装并配置 ChromeDriver
+        run: seleniumbase install chromedriver
+
+      - name: 下载并解压 NopeCHA 扩展
+        run: |
+          mkdir -p scripts/extensions/nopecha
+          wget -q -O scripts/extensions/nopecha/chromium.zip \
+            https://github.com/NopeCHALLC/nopecha-extension/releases/download/0.6.1/chromium.zip
+          7z x -y scripts/extensions/nopecha/chromium.zip -oscripts/extensions/nopecha/unpacked
+
+      - name: 克隆 hcaptcha-challenger
+        run: |
+          git clone --depth 1 https://github.com/aoi675145/hcaptcha.git hcaptcha-challenger
+          cd hcaptcha-challenger
+          git fetch --depth 1 origin d4da375916cde6bb85128eb8fc9859e1f06cacbc \
+            && git checkout --detach FETCH_HEAD \
+            || echo "[WARN] 固定 commit 获取失败，使用克隆时的 main HEAD"
+          git rev-parse HEAD
+
+      - name: 配置并启动 sing-box 节点代理
+        run: |
+          chmod +x scripts/setup_proxy.sh
+          bash scripts/setup_proxy.sh || echo "[INFO] 代理未配置或失败，尝试直连模式"
+
+      - name: 执行 Kerit 心跳续期核心脚本
+        run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/kerit/main_ai.py
