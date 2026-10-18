@@ -2,8 +2,8 @@ name: Kerit Cloud 自动心跳续期
 
 on:
   schedule:
-    # 每天北京时间 10:00 和 22:00 各执行一次 (UTC 02:00, 14:00)
-    - cron: '0 2,14 * * *'
+    # 每 5 天北京时间 10:00 自动执行一次 (UTC 02:00)，登录后一次性将心跳时间加至封顶
+    - cron: '0 2 */5 * *'
   workflow_dispatch:
 
 permissions:
