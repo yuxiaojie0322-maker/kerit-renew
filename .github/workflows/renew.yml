@@ -87,3 +87,11 @@ jobs:
 
       - name: 执行 Kerit 心跳续期核心脚本
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/kerit/main_ai.py
+
+      - name: 上传执行截图 (Artifacts)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kerit-screenshots
+          path: screenshots/
+          retention-days: 7
