@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 env:
@@ -15,6 +15,7 @@ env:
   KERIT:           ${{ secrets.KERIT }}
   KERIT_EMAIL:     ${{ secrets.KERIT_EMAIL }}
   KERIT_PASSWORD:  ${{ secrets.KERIT_PASSWORD }}
+  KERIT_COOKIES:   ${{ secrets.KERIT_COOKIES }}
   TG_BOT_TOKEN:    ${{ secrets.TG_BOT_TOKEN }}
   TG_CHAT_ID:      ${{ secrets.TG_CHAT_ID }}
   NOPECHA_KEY:     ${{ secrets.NOPECHA_KEY }}
@@ -87,6 +88,23 @@ jobs:
 
       - name: 执行 Kerit 心跳续期核心脚本
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/kerit/main_ai.py
+
+      - name: 同步并持久化最新 Cookie 到私有仓库
+        if: always()
+        run: |
+          cd scripts
+          if [ -f "kerit/session.json" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add kerit/session.json
+            if ! git diff --staged --quiet; then
+              git commit -m "chore(kerit): 自动持久化最新 30 天 Cookie [skip ci]"
+              git push origin main
+              echo "✅ 最新会话 Cookie 已成功回写并保存到 my-private-scripts 私有仓库！"
+            else
+              echo "ℹ️ Cookie 无变化，无需重复提交"
+            fi
+          fi
 
       - name: 上传执行截图 (Artifacts)
         if: always()
