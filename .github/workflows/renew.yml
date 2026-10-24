@@ -83,9 +83,18 @@ jobs:
 
       - name: 配置并启动 sing-box 节点代理
         run: |
-          chmod +x scripts/setup_proxy.sh
-          bash scripts/setup_proxy.sh || echo "[INFO] 代理未配置或失败，尝试直连模式"
-
+          PROXY_SCRIPT=""
+          if [ -f "scripts/kerit/setup_proxy.sh" ]; then
+            PROXY_SCRIPT="scripts/kerit/setup_proxy.sh"
+          elif [ -f "scripts/setup_proxy.sh" ]; then
+            PROXY_SCRIPT="scripts/setup_proxy.sh"
+          fi
+          if [ -n "$PROXY_SCRIPT" ]; then
+            chmod +x "$PROXY_SCRIPT"
+            bash "$PROXY_SCRIPT" || echo "[INFO] 代理未配置或失败，尝试直连模式"
+          else
+            echo "[INFO] 未找到 setup_proxy.sh，尝试直连模式"
+          fi
       - name: 执行 Kerit 心跳续期核心脚本
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/kerit/main_ai.py
 
